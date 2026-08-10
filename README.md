@@ -1,0 +1,2 @@
+# supervisor
+🏡 Home Assistant Supervisor

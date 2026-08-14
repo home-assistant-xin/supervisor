@@ -1,0 +1,432 @@
+name: CI
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches:
+      - main
+  pull_request: ~
+
+env:
+  DEFAULT_PYTHON: "3.14.6"
+  PRE_COMMIT_CACHE: ~/.cache/pre-commit
+  MYPY_CACHE_VERSION: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Separate job to pre-populate the base dependency cache
+  # This prevent upcoming jobs to do the same individually
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      python-version: ${{ steps.python.outputs.python-version }}
+    name: Prepare Python dependencies
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.DEFAULT_PYTHON }}
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: |
+            ${{ runner.os }}-venv-${{ steps.python.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Create Python virtual environment
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          python -m venv venv
+          . venv/bin/activate
+          pip install -U pip setuptools
+          pip install -r requirements.txt -r requirements_tests.txt
+      - name: Restore pre-commit environment from cache
+        id: cache-precommit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PRE_COMMIT_CACHE }}
+          lookup-only: true
+          key: |
+            ${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pre-commit-
+      - name: Install pre-commit dependencies
+        if: steps.cache-precommit.outputs.cache-hit != 'true'
+        run: |
+          . venv/bin/activate
+          pre-commit install-hooks
+
+  lint-ruff-format:
+    name: Check ruff-format
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python ${{ needs.prepare.outputs.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: ${{ needs.prepare.outputs.python-version }}
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: |
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Fail job if Python cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Restore pre-commit environment from cache
+        id: cache-precommit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PRE_COMMIT_CACHE }}
+          key: |
+            ${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Fail job if cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Run ruff-format
+        run: |
+          . venv/bin/activate
+          pre-commit run --hook-stage manual ruff-format --all-files --show-diff-on-failure
+        env:
+          RUFF_OUTPUT_FORMAT: github
+
+  lint-ruff:
+    name: Check ruff
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python ${{ needs.prepare.outputs.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: ${{ needs.prepare.outputs.python-version }}
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: |
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Fail job if Python cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Restore pre-commit environment from cache
+        id: cache-precommit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PRE_COMMIT_CACHE }}
+          key: |
+            ${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Fail job if cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Run ruff
+        run: |
+          . venv/bin/activate
+          pre-commit run --hook-stage manual ruff --all-files --show-diff-on-failure
+        env:
+          RUFF_OUTPUT_FORMAT: github
+
+  lint-dockerfile:
+    name: Check Dockerfile
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Register hadolint problem matcher
+        run: |
+          echo "::add-matcher::.github/workflows/matchers/hadolint.json"
+      - name: Check Dockerfile
+        uses: docker://hadolint/hadolint:v1.18.0
+        with:
+          args: hadolint Dockerfile
+
+  lint-executable-shebangs:
+    name: Check executables
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python ${{ needs.prepare.outputs.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: ${{ needs.prepare.outputs.python-version }}
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: |
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Fail job if Python cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Restore pre-commit environment from cache
+        id: cache-precommit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PRE_COMMIT_CACHE }}
+          key: |
+            ${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Fail job if cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Register check executables problem matcher
+        run: |
+          echo "::add-matcher::.github/workflows/matchers/check-executables-have-shebangs.json"
+      - name: Run executables check
+        run: |
+          . venv/bin/activate
+          pre-commit run --hook-stage manual check-executables-have-shebangs --all-files
+
+  lint-json:
+    name: Check JSON
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python ${{ needs.prepare.outputs.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: ${{ needs.prepare.outputs.python-version }}
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: |
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Fail job if Python cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Restore pre-commit environment from cache
+        id: cache-precommit
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.PRE_COMMIT_CACHE }}
+          key: |
+            ${{ runner.os }}-pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+      - name: Fail job if cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Register check-json problem matcher
+        run: |
+          echo "::add-matcher::.github/workflows/matchers/check-json.json"
+      - name: Run check-json
+        run: |
+          . venv/bin/activate
+          pre-commit run --hook-stage manual check-json --all-files
+
+  lint-pylint:
+    name: Check pylint
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python ${{ needs.prepare.outputs.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: ${{ needs.prepare.outputs.python-version }}
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: |
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Fail job if Python cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Install additional system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpulse0
+      - name: Register pylint problem matcher
+        run: |
+          echo "::add-matcher::.github/workflows/matchers/pylint.json"
+      - name: Run pylint
+        run: |
+          . venv/bin/activate
+          pylint supervisor tests
+
+  mypy:
+    name: Check mypy
+    runs-on: ubuntu-latest
+    needs: prepare
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python ${{ needs.prepare.outputs.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: ${{ needs.prepare.outputs.python-version }}
+      - name: Generate partial mypy restore key
+        id: generate-mypy-key
+        run: |
+          mypy_version=$(cat requirements_test.txt | grep mypy | cut -d '=' -f 3)
+          echo "version=$mypy_version" >> $GITHUB_OUTPUT
+          echo "key=mypy-${{ env.MYPY_CACHE_VERSION }}-$mypy_version-$(date -u '+%Y-%m-%dT%H:%M:%s')" >> $GITHUB_OUTPUT
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: >-
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Fail job if Python cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Restore mypy cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .mypy_cache
+          key: >-
+            ${{ runner.os }}-mypy-${{ needs.prepare.outputs.python-version }}-${{ steps.generate-mypy-key.outputs.key }}
+          restore-keys: >-
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-mypy-${{ env.MYPY_CACHE_VERSION }}-${{ steps.generate-mypy-key.outputs.version }}
+      - name: Register mypy problem matcher
+        run: |
+          echo "::add-matcher::.github/workflows/matchers/mypy.json"
+      - name: Run mypy
+        run: |
+          . venv/bin/activate
+          mypy supervisor
+
+  pytest:
+    runs-on: ubuntu-latest
+    needs: prepare
+    name: Run tests Python ${{ needs.prepare.outputs.python-version }}
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python ${{ needs.prepare.outputs.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: ${{ needs.prepare.outputs.python-version }}
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v2.5.3"
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: |
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Fail job if Python cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Install additional system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libpulse0 libudev1 dbus-daemon
+      - name: Register Python problem matcher
+        run: |
+          echo "::add-matcher::.github/workflows/matchers/python.json"
+      - name: Install Pytest Annotation plugin
+        run: |
+          . venv/bin/activate
+          # Ideally this should be part of our dependencies
+          # However this plugin is fairly new and doesn't run correctly
+          # on a non-GitHub environment.
+          pip install pytest-github-actions-annotate-failures
+      - name: Run pytest
+        run: |
+          . venv/bin/activate
+          pytest \
+            -qq \
+            -n auto \
+            --dist=loadfile \
+            --durations=10 \
+            --cov supervisor \
+            -o console_output_style=count \
+            tests
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage
+          path: .coverage
+          include-hidden-files: true
+
+  coverage:
+    name: Process test coverage
+    runs-on: ubuntu-latest
+    needs: ["pytest", "prepare"]
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python ${{ needs.prepare.outputs.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: python
+        with:
+          python-version: ${{ needs.prepare.outputs.python-version }}
+      - name: Restore Python virtual environment
+        id: cache-venv
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: venv
+          key: |
+            ${{ runner.os }}-venv-${{ needs.prepare.outputs.python-version }}-${{ hashFiles('requirements.txt') }}-${{ hashFiles('requirements_tests.txt') }}
+      - name: Fail job if Python cache restore failed
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          echo "Failed to restore Python virtual environment from cache"
+          exit 1
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coverage
+          path: coverage/
+      - name: Combine coverage results
+        run: |
+          . venv/bin/activate
+          coverage combine coverage*/.coverage*
+          coverage report
+          coverage xml
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0

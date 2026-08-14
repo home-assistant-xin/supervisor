@@ -1,0 +1,13 @@
+{
+  "advanced": false,
+  "arch": [
+    "amd64"
+  ],
+  "slug": "test",
+  "description": "Test add-on",
+  "location": "tmp_path",
+  "name": "Test Add-on",
+  "repository": "a474bbd1",
+  "stage": "stable",
+  "version": "1.0.0"
+}

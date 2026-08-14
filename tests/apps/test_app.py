@@ -1,0 +1,1598 @@
+"""Test Home Assistant Apps."""
+
+import asyncio
+from datetime import timedelta
+import errno
+from http import HTTPStatus
+import logging
+from pathlib import Path, PurePath
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
+
+import aiodocker
+from aiodocker.containers import DockerContainer
+from awesomeversion import AwesomeVersion
+import pytest
+from securetar import SecureTarArchive, SecureTarFile
+
+from supervisor.apps.app import App
+from supervisor.apps.const import AppBackupMode
+from supervisor.apps.model import AppModel
+from supervisor.const import (
+    ATTR_ADVANCED,
+    ATTR_LOCATION,
+    ATTR_PORTS,
+    AppBoot,
+    AppState,
+    BusEvent,
+)
+from supervisor.coresys import CoreSys
+from supervisor.docker.app import DockerApp
+from supervisor.docker.const import ContainerState
+from supervisor.docker.manager import CommandReturn, DockerAPI
+from supervisor.docker.monitor import DockerContainerStateEvent
+from supervisor.exceptions import (
+    AppFileReadError,
+    AppPortConflict,
+    AppPrePostBackupCommandReturnedError,
+    AppsJobError,
+    AppUnknownError,
+    AudioUpdateError,
+    DockerRegistryAuthError,
+    HassioError,
+)
+from supervisor.hardware.helper import HwHelper
+from supervisor.ingress import Ingress
+from supervisor.resolution.const import (
+    ContextType,
+    IssueType,
+    SuggestionType,
+    UnhealthyReason,
+)
+from supervisor.resolution.data import Issue
+from supervisor.utils.dt import utcnow
+
+from .test_manager import BOOT_FAIL_ISSUE, BOOT_FAIL_SUGGESTIONS
+
+from tests.common import fire_bus_event, force_app_state, get_fixture_path, is_in_list
+from tests.const import TEST_ADDON_SLUG
+
+
+async def _fire_test_event(
+    coresys: CoreSys,
+    name: str,
+    state: ContainerState,
+    exit_code: int | None = None,
+) -> None:
+    """Fire a test event and await the listener tasks the bus spawned."""
+    await fire_bus_event(
+        coresys,
+        BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
+        DockerContainerStateEvent(
+            name=name,
+            state=state,
+            id="abc123",
+            time=1,
+            exit_code=exit_code,
+        ),
+    )
+
+
+def test_options_merge(coresys: CoreSys, install_app_ssh: App) -> None:
+    """Test options merge."""
+    app = coresys.apps.get(TEST_ADDON_SLUG)
+
+    assert app.options == {
+        "apks": [],
+        "authorized_keys": [],
+        "password": "",
+        "server": {"tcp_forwarding": False},
+    }
+
+    app.options = {"password": "test"}
+    assert app.persist["options"] == {"password": "test"}
+    assert app.options == {
+        "apks": [],
+        "authorized_keys": [],
+        "password": "test",
+        "server": {"tcp_forwarding": False},
+    }
+
+    app.options = {"password": "test", "apks": ["gcc"]}
+    assert app.persist["options"] == {"password": "test", "apks": ["gcc"]}
+    assert app.options == {
+        "apks": ["gcc"],
+        "authorized_keys": [],
+        "password": "test",
+        "server": {"tcp_forwarding": False},
+    }
+
+    app.options = {"password": "test", "server": {"tcp_forwarding": True}}
+    assert app.persist["options"] == {
+        "password": "test",
+        "server": {"tcp_forwarding": True},
+    }
+    assert app.options == {
+        "apks": [],
+        "authorized_keys": [],
+        "password": "test",
+        "server": {"tcp_forwarding": True},
+    }
+
+    # Test overwrite
+    test = app.options
+    test["server"]["test"] = 1
+    assert app.options == {
+        "apks": [],
+        "authorized_keys": [],
+        "password": "test",
+        "server": {"tcp_forwarding": True},
+    }
+    app.options = {"password": "test", "server": {"tcp_forwarding": True}}
+
+
+async def test_app_state_listener(coresys: CoreSys, install_app_ssh: App) -> None:
+    """Test app is setting state from docker events."""
+    with (
+        patch.object(DockerApp, "attach"),
+        patch.object(DockerApp, "current_state", return_value=ContainerState.UNKNOWN),
+    ):
+        await install_app_ssh.load()
+
+    assert install_app_ssh.state == AppState.UNKNOWN
+
+    with patch.object(App, "watchdog_container"):
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING
+        )
+        assert install_app_ssh.state == AppState.STARTED
+
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STOPPED
+        )
+        assert install_app_ssh.state == AppState.STOPPED
+
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.HEALTHY
+        )
+        assert install_app_ssh.state == AppState.STARTED
+
+        await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.FAILED)
+        assert install_app_ssh.state == AppState.ERROR
+
+        # Test other apps are ignored
+        await _fire_test_event(
+            coresys, "app_local_non_installed", ContainerState.RUNNING
+        )
+        assert install_app_ssh.state == AppState.ERROR
+
+
+async def test_app_failed_logs_exit_code(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test FAILED transition logs exit code with appropriate severity."""
+    with patch.object(DockerApp, "attach"):
+        await install_app_ssh.load()
+
+    with patch.object(App, "watchdog_container"):
+        # Exit 143 (SIGTERM default disposition): warning nudging author
+        caplog.clear()
+        await _fire_test_event(
+            coresys,
+            f"app_{TEST_ADDON_SLUG}",
+            ContainerState.FAILED,
+            exit_code=143,
+        )
+        assert install_app_ssh.state == AppState.ERROR
+        warnings = [
+            r for r in caplog.records if r.levelno == logging.WARNING and r.message
+        ]
+        assert any("did not handle SIGTERM" in r.message for r in warnings)
+
+        # Any other non-zero exit: error
+        caplog.clear()
+        await _fire_test_event(
+            coresys,
+            f"app_{TEST_ADDON_SLUG}",
+            ContainerState.FAILED,
+            exit_code=1,
+        )
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("exit code 1" in r.message for r in errors)
+
+        # No exit code available: stay silent
+        caplog.clear()
+        await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.FAILED)
+        assert not any(
+            "exit code" in r.message or "SIGTERM" in r.message for r in caplog.records
+        )
+
+
+async def test_app_watchdog(coresys: CoreSys, install_app_ssh: App) -> None:
+    """Test app watchdog works correctly."""
+    with patch.object(DockerApp, "attach"):
+        await install_app_ssh.load()
+
+    install_app_ssh.watchdog = True
+    install_app_ssh._manual_stop = False  # pylint: disable=protected-access
+
+    # Watchdog does ``await (await self.start())`` because App.start returns
+    # an asyncio.Task. The mock must mirror that shape.
+    done_task = asyncio.get_running_loop().create_future()
+    done_task.set_result(None)
+    with (
+        patch.object(App, "restart", AsyncMock(return_value=done_task)) as restart,
+        patch.object(App, "start", AsyncMock(return_value=done_task)) as start,
+        patch.object(DockerApp, "current_state") as current_state,
+    ):
+        # Restart if it becomes unhealthy
+        current_state.return_value = ContainerState.UNHEALTHY
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.UNHEALTHY
+        )
+        restart.assert_called_once()
+        start.assert_not_called()
+
+        restart.reset_mock()
+
+        # Rebuild if it failed
+        current_state.return_value = ContainerState.FAILED
+        with patch.object(DockerApp, "stop") as stop:
+            await _fire_test_event(
+                coresys,
+                f"app_{TEST_ADDON_SLUG}",
+                ContainerState.FAILED,
+                exit_code=1,
+            )
+            stop.assert_called_once_with(remove_container=True)
+            restart.assert_not_called()
+            start.assert_called_once()
+
+        start.reset_mock()
+
+        # Do not process event if container state has changed since fired
+        current_state.return_value = ContainerState.HEALTHY
+        await _fire_test_event(
+            coresys,
+            f"app_{TEST_ADDON_SLUG}",
+            ContainerState.FAILED,
+            exit_code=1,
+        )
+        restart.assert_not_called()
+        start.assert_not_called()
+
+        # Other apps ignored
+        current_state.return_value = ContainerState.UNHEALTHY
+        await _fire_test_event(
+            coresys, "app_local_non_installed", ContainerState.UNHEALTHY
+        )
+        restart.assert_not_called()
+        start.assert_not_called()
+
+
+async def test_watchdog_port_conflict_does_not_retry(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Watchdog must not retry or capture when start fails with a port conflict."""
+    with patch.object(DockerApp, "attach"):
+        await install_app_ssh.load()
+
+    install_app_ssh.watchdog = True
+    install_app_ssh._manual_stop = False  # pylint: disable=protected-access
+
+    with (
+        patch.object(
+            App, "start", side_effect=AppPortConflict(name=TEST_ADDON_SLUG, port=2222)
+        ) as start,
+        patch.object(DockerApp, "current_state", return_value=ContainerState.FAILED),
+        patch.object(DockerApp, "stop"),
+        patch("supervisor.apps.app.async_capture_exception") as capture_exception,
+    ):
+        caplog.clear()
+        await _fire_test_event(
+            coresys,
+            f"app_{TEST_ADDON_SLUG}",
+            ContainerState.FAILED,
+            exit_code=1,
+        )
+
+        start.assert_called_once()
+        capture_exception.assert_not_called()
+        assert f"Watchdog cannot restart app {install_app_ssh.name}" in caplog.text
+
+
+async def test_watchdog_on_stop(coresys: CoreSys, install_app_ssh: App) -> None:
+    """Test app watchdog restarts app on stop if not manual."""
+    with patch.object(DockerApp, "attach"):
+        await install_app_ssh.load()
+
+    install_app_ssh.watchdog = True
+
+    # Watchdog does ``await (await self.restart())`` because App.restart
+    # returns an asyncio.Task; the mock must mirror that shape.
+    done_task = asyncio.get_running_loop().create_future()
+    done_task.set_result(None)
+    with (
+        patch.object(App, "restart", AsyncMock(return_value=done_task)) as restart,
+        patch.object(
+            DockerApp,
+            "current_state",
+            return_value=ContainerState.STOPPED,
+        ),
+        patch.object(DockerApp, "stop"),
+    ):
+        # Do not restart when app stopped by user
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING
+        )
+        await install_app_ssh.stop()
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STOPPED
+        )
+        restart.assert_not_called()
+
+        # Do restart app if it stops and user didn't do it
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING
+        )
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STOPPED
+        )
+        restart.assert_called_once()
+
+
+@pytest.mark.usefixtures("mock_amd64_arch_supported", "test_repository")
+async def test_listener_attached_on_install(coresys: CoreSys):
+    """Test events listener attached on app install."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    coresys.docker.containers.get.side_effect = aiodocker.DockerError(
+        500, {"message": "fail"}
+    )
+    with (
+        patch("pathlib.Path.is_dir", return_value=True),
+        patch(
+            "supervisor.apps.app.App.need_build",
+            new=PropertyMock(return_value=False),
+        ),
+        patch(
+            "supervisor.apps.model.AppModel.with_ingress",
+            new=PropertyMock(return_value=False),
+        ),
+    ):
+        await coresys.apps.install(TEST_ADDON_SLUG)
+
+    # Normally this would be defaulted to False on start of the app but test skips that
+    coresys.apps.get_local_only(TEST_ADDON_SLUG).watchdog = False
+
+    await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+    assert coresys.apps.get(TEST_ADDON_SLUG).state == AppState.STARTED
+
+
+@pytest.mark.parametrize(
+    ("boot_timedelta", "restart_count"), [(timedelta(), 1), (timedelta(days=1), 0)]
+)
+@pytest.mark.usefixtures("test_repository")
+async def test_watchdog_during_attach(
+    coresys: CoreSys,
+    boot_timedelta: timedelta,
+    restart_count: int,
+):
+    """Test host reboot treated as manual stop but not supervisor restart."""
+    store = coresys.apps.store[TEST_ADDON_SLUG]
+    await coresys.apps.data.install(store)
+
+    # Watchdog does ``await (await self.restart())`` because App.restart
+    # returns an asyncio.Task; the mock must mirror that shape.
+    done_task = asyncio.get_running_loop().create_future()
+    done_task.set_result(None)
+    with (
+        patch.object(App, "restart", AsyncMock(return_value=done_task)) as restart,
+        patch.object(HwHelper, "last_boot", return_value=utcnow()),
+        patch.object(DockerApp, "attach"),
+        patch.object(
+            DockerApp,
+            "current_state",
+            return_value=ContainerState.STOPPED,
+        ),
+    ):
+        coresys.config.last_boot = (
+            await coresys.hardware.helper.last_boot() + boot_timedelta
+        )
+        app = App(coresys, store.slug)
+        coresys.apps.local[app.slug] = app
+        app.watchdog = True
+
+        await app.load()
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STOPPED
+        )
+
+        assert restart.call_count == restart_count
+
+
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_install_update_fails_if_out_of_date(coresys: CoreSys):
+    """Test install or update of app fails when supervisor or plugin is out of date."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with patch.object(
+        type(coresys.supervisor), "need_update", new=PropertyMock(return_value=True)
+    ):
+        with pytest.raises(AppsJobError):
+            await coresys.apps.install(TEST_ADDON_SLUG)
+        with pytest.raises(AppsJobError):
+            await coresys.apps.update(TEST_ADDON_SLUG)
+
+    with (
+        patch.object(
+            type(coresys.plugins.audio),
+            "need_update",
+            new=PropertyMock(return_value=True),
+        ),
+        patch.object(
+            type(coresys.plugins.audio), "update", side_effect=AudioUpdateError
+        ),
+    ):
+        with pytest.raises(AppsJobError):
+            await coresys.apps.install(TEST_ADDON_SLUG)
+        with pytest.raises(AppsJobError):
+            await coresys.apps.update(TEST_ADDON_SLUG)
+
+
+async def test_listeners_removed_on_uninstall(
+    coresys: CoreSys, install_app_ssh: App
+) -> None:
+    """Test app listeners are removed on uninstall."""
+    with patch.object(DockerApp, "attach"):
+        await install_app_ssh.load()
+
+    assert install_app_ssh.loaded is True
+    # pylint: disable=protected-access
+    listeners = install_app_ssh._listeners
+    for listener in listeners:
+        assert (
+            listener in coresys.bus._listeners[BusEvent.DOCKER_CONTAINER_STATE_CHANGE]
+        )
+
+    with patch.object(App, "persist", new=PropertyMock(return_value=MagicMock())):
+        await coresys.apps.uninstall(TEST_ADDON_SLUG)
+
+    for listener in listeners:
+        assert (
+            listener
+            not in coresys.bus._listeners[BusEvent.DOCKER_CONTAINER_STATE_CHANGE]
+        )
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_load_settles_state_from_running_container(
+    install_app_ssh: App, container: DockerContainer
+) -> None:
+    """Test load derives the state from a running container, not the default."""
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+    await install_app_ssh.load()
+    # State is settled synchronously from current_state(), so it reflects the
+    # running container immediately rather than the image-only STOPPED default.
+    assert install_app_ssh.state == AppState.STARTED
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_start(coresys: CoreSys, install_app_ssh: App) -> None:
+    """Test starting an app without healthcheck."""
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+    await asyncio.sleep(0)
+    assert install_app_ssh.state == AppState.STOPPED
+
+    start_task = await install_app_ssh.start()
+    assert start_task
+
+    await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+    await start_task
+    assert install_app_ssh.state == AppState.STARTED
+
+
+@pytest.mark.parametrize("state", [ContainerState.HEALTHY, ContainerState.UNHEALTHY])
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_start_wait_healthcheck(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: DockerContainer,
+    state: ContainerState,
+) -> None:
+    """Test starting an app with a healthcheck waits for health status."""
+    install_app_ssh.path_data.mkdir()
+    container.show.return_value["Config"] = {"Healthcheck": "exists"}
+    await install_app_ssh.load()
+    await asyncio.sleep(0)
+    assert install_app_ssh.state == AppState.STOPPED
+
+    start_task = await install_app_ssh.start()
+    assert start_task
+
+    await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+
+    assert not start_task.done()
+    assert install_app_ssh.state == AppState.STARTUP
+
+    await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", state)
+
+    assert start_task.done()
+    assert install_app_ssh.state == AppState.STARTED
+
+
+@pytest.mark.usefixtures("coresys", "tmp_supervisor_data", "path_extern")
+async def test_start_timeout(
+    install_app_ssh: App, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test starting an app times out while waiting."""
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+    await asyncio.sleep(0)
+    assert install_app_ssh.state == AppState.STOPPED
+
+    start_task = await install_app_ssh.start()
+    assert start_task
+
+    caplog.clear()
+    with patch(
+        "supervisor.apps.app.asyncio.wait_for", side_effect=asyncio.TimeoutError
+    ):
+        await start_task
+
+    assert "Timeout while waiting for app Terminal & SSH to start" in caplog.text
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_restart(coresys: CoreSys, install_app_ssh: App) -> None:
+    """Test restarting an app."""
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+    await asyncio.sleep(0)
+    assert install_app_ssh.state == AppState.STOPPED
+
+    start_task = await install_app_ssh.restart()
+    assert start_task
+
+    await _fire_test_event(coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.RUNNING)
+    await start_task
+    assert install_app_ssh.state == AppState.STARTED
+
+
+@pytest.mark.parametrize("status", ["running", "stopped"])
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_backup(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: DockerContainer,
+    status: str,
+) -> None:
+    """Test backing up an app."""
+    container.show.return_value["State"]["Status"] = status
+    container.show.return_value["State"]["Running"] = status == "running"
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+
+    archive = SecureTarArchive(coresys.config.path_tmp / "test.tar", "w")
+    archive.open()
+    tar_file = archive.create_tar("./test.tar.gz")
+    assert await install_app_ssh.backup(tar_file) is None
+    archive.close()
+
+
+@pytest.mark.parametrize("status", ["running", "stopped"])
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_backup_no_config(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: DockerContainer,
+    status: str,
+) -> None:
+    """Test backing up an app with deleted config directory."""
+    container.show.return_value["State"]["Status"] = status
+    container.show.return_value["State"]["Running"] = status == "running"
+
+    install_app_ssh.data["map"].append({"type": "addon_config", "read_only": False})
+    assert not install_app_ssh.path_config.exists()
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+
+    archive = SecureTarArchive(coresys.config.path_tmp / "test.tar", "w")
+    archive.open()
+    tar_file = archive.create_tar("./test.tar.gz")
+    assert await install_app_ssh.backup(tar_file) is None
+    archive.close()
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_backup_with_pre_post_command(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: DockerContainer,
+) -> None:
+    """Test backing up an app with pre and post command."""
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+
+    archive = SecureTarArchive(coresys.config.path_tmp / "test.tar", "w")
+    archive.open()
+    tar_file = archive.create_tar("./test.tar.gz")
+    with (
+        patch.object(App, "backup_pre", new=PropertyMock(return_value="backup_pre")),
+        patch.object(App, "backup_post", new=PropertyMock(return_value="backup_post")),
+    ):
+        assert await install_app_ssh.backup(tar_file) is None
+    archive.close()
+
+    assert container.exec.call_count == 2
+    assert container.exec.call_args_list[0].args[0] == "backup_pre"
+    assert container.exec.call_args_list[1].args[0] == "backup_post"
+
+
+@pytest.mark.parametrize(
+    (
+        "container_get_side_effect",
+        "exec_start_side_effect",
+        "exec_inspect_side_effect",
+        "exc_type_raised",
+    ),
+    [
+        (
+            aiodocker.DockerError(HTTPStatus.NOT_FOUND, {"message": "missing"}),
+            None,
+            [{"ExitCode": 1}],
+            AppUnknownError,
+        ),
+        (
+            aiodocker.DockerError(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": "bad"}),
+            None,
+            [{"ExitCode": 1}],
+            AppUnknownError,
+        ),
+        (
+            None,
+            aiodocker.DockerError(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": "bad"}),
+            [{"ExitCode": 1}],
+            AppUnknownError,
+        ),
+        (
+            None,
+            None,
+            aiodocker.DockerError(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": "bad"}),
+            AppUnknownError,
+        ),
+        (None, None, [{"ExitCode": 1}], AppPrePostBackupCommandReturnedError),
+    ],
+)
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_backup_with_pre_command_error(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container_get_side_effect: aiodocker.DockerError | None,
+    exec_start_side_effect: aiodocker.DockerError | None,
+    exec_inspect_side_effect: aiodocker.DockerError | list[dict[str, Any]] | None,
+    exc_type_raised: type[HassioError],
+) -> None:
+    """Test backing up an app with error running pre command."""
+    coresys.docker.containers.get.side_effect = container_get_side_effect
+    coresys.docker.containers.get.return_value.exec.return_value.start.side_effect = (
+        exec_start_side_effect
+    )
+    coresys.docker.containers.get.return_value.exec.return_value.inspect.side_effect = (
+        exec_inspect_side_effect
+    )
+
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+
+    archive = SecureTarArchive(coresys.config.path_tmp / "test.tar", "w")
+    archive.open()
+    tar_file = archive.create_tar("./test.tar.gz")
+    with (
+        patch.object(DockerApp, "is_running", return_value=True),
+        patch.object(App, "backup_pre", new=PropertyMock(return_value="backup_pre")),
+        pytest.raises(exc_type_raised),
+    ):
+        assert await install_app_ssh.backup(tar_file) is None
+
+    assert not tar_file.path.exists()
+    archive.close()
+
+
+@pytest.mark.parametrize("status", ["running", "stopped"])
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_backup_cold_mode(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: DockerContainer,
+    status: str,
+) -> None:
+    """Test backing up an app in cold mode."""
+    container.show.return_value["State"]["Status"] = status
+    container.show.return_value["State"]["Running"] = status == "running"
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+
+    archive = SecureTarArchive(coresys.config.path_tmp / "test.tar", "w")
+    archive.open()
+    tar_file = archive.create_tar("./test.tar.gz")
+    with (
+        patch.object(
+            AppModel,
+            "backup_mode",
+            new=PropertyMock(return_value=AppBackupMode.COLD),
+        ),
+        patch.object(
+            DockerApp, "is_running", side_effect=[status == "running", False, False]
+        ),
+    ):
+        start_task = await install_app_ssh.backup(tar_file)
+    archive.close()
+
+    assert bool(start_task) is (status == "running")
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
+async def test_backup_cold_mode_with_watchdog(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: DockerContainer,
+):
+    """Test backing up an app in cold mode with watchdog active."""
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+    install_app_ssh.watchdog = True
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+    # Clear task queue, including the event fired for running container
+    await asyncio.sleep(0)
+
+    # Simulate stop firing the docker event for stopped container like it normally would
+    async def mock_stop(*args, **kwargs):
+        container.show.return_value["State"]["Status"] = "stopped"
+        container.show.return_value["State"]["Running"] = False
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STOPPED
+        )
+
+    # Patching out the normal end of backup process leaves the container in a stopped state
+    # Watchdog should still not try to restart it though, it should remain this way
+    archive = SecureTarArchive(coresys.config.path_tmp / "test.tar", "w")
+    archive.open()
+    tar_file = archive.create_tar("./test.tar.gz")
+    with (
+        patch.object(App, "start") as start,
+        patch.object(App, "restart") as restart,
+        patch.object(App, "end_backup"),
+        patch.object(DockerApp, "stop", new=mock_stop),
+        patch.object(
+            AppModel,
+            "backup_mode",
+            new=PropertyMock(return_value=AppBackupMode.COLD),
+        ),
+    ):
+        await install_app_ssh.backup(tar_file)
+        await asyncio.sleep(0)
+        start.assert_not_called()
+        restart.assert_not_called()
+    archive.close()
+
+
+@pytest.mark.parametrize("status", ["running", "stopped"])
+@pytest.mark.usefixtures(
+    "tmp_supervisor_data", "path_extern", "mock_aarch64_arch_supported"
+)
+async def test_restore(coresys: CoreSys, install_app_ssh: App, status: str) -> None:
+    """Test restoring an app."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+
+    tarfile = SecureTarFile(get_fixture_path(f"backup_local_ssh_{status}.tar.gz"))
+    with patch.object(DockerApp, "is_running", return_value=False):
+        start_task = await coresys.apps.restore(TEST_ADDON_SLUG, tarfile)
+
+    assert bool(start_task) is (status == "running")
+
+
+@pytest.mark.usefixtures(
+    "tmp_supervisor_data", "path_extern", "mock_aarch64_arch_supported"
+)
+async def test_restore_while_running(
+    coresys: CoreSys, install_app_ssh: App, container: DockerContainer
+):
+    """Test restore of a running app."""
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.path_data.mkdir()
+    await install_app_ssh.load()
+
+    tarfile = SecureTarFile(get_fixture_path("backup_local_ssh_stopped.tar.gz"))
+    with (
+        patch.object(DockerApp, "is_running", return_value=True),
+        patch.object(Ingress, "update_hass_panel"),
+    ):
+        start_task = await coresys.apps.restore(TEST_ADDON_SLUG, tarfile)
+
+    assert bool(start_task) is False
+    container.stop.assert_called_once()
+
+
+@pytest.mark.usefixtures(
+    "tmp_supervisor_data", "path_extern", "mock_aarch64_arch_supported"
+)
+async def test_restore_while_running_with_watchdog(
+    coresys: CoreSys, install_app_ssh: App, container: DockerContainer
+):
+    """Test restore of a running app with watchdog interference."""
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.path_data.mkdir()
+    install_app_ssh.watchdog = True
+    await install_app_ssh.load()
+
+    # Simulate stop firing the docker event for stopped container like it normally would
+    async def mock_stop(*args, **kwargs):
+        container.show.return_value["State"]["Status"] = "stopped"
+        container.show.return_value["State"]["Running"] = False
+        await _fire_test_event(
+            coresys, f"app_{TEST_ADDON_SLUG}", ContainerState.STOPPED
+        )
+
+    # We restore a stopped backup so restore will not restart it
+    # Watchdog will see it stop and should not attempt reanimation either
+    tarfile = SecureTarFile(get_fixture_path("backup_local_ssh_stopped.tar.gz"))
+    with (
+        patch.object(App, "start") as start,
+        patch.object(App, "restart") as restart,
+        patch.object(DockerApp, "stop", new=mock_stop),
+        patch.object(Ingress, "update_hass_panel"),
+    ):
+        await coresys.apps.restore(TEST_ADDON_SLUG, tarfile)
+        await asyncio.sleep(0)
+        start.assert_not_called()
+        restart.assert_not_called()
+
+
+@pytest.mark.usefixtures("coresys")
+async def test_start_when_running(
+    install_app_ssh: App,
+    container: DockerContainer,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Test starting an app without healthcheck."""
+    container.show.return_value["State"]["Status"] = "running"
+    container.show.return_value["State"]["Running"] = True
+    await install_app_ssh.load()
+    await asyncio.sleep(0)
+    assert install_app_ssh.state == AppState.STARTED
+
+    caplog.clear()
+    start_task = await install_app_ssh.start()
+    assert start_task
+    await start_task
+
+    assert "local_ssh is already running" in caplog.text
+
+
+@pytest.mark.usefixtures("test_repository", "mock_aarch64_arch_supported")
+async def test_local_example_install(coresys: CoreSys, tmp_supervisor_data: Path):
+    """Test install of an app."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    assert not (
+        data_dir := tmp_supervisor_data / "apps" / "data" / "local_example"
+    ).exists()
+
+    with patch.object(DockerApp, "install") as install:
+        await coresys.apps.install("local_example")
+        install.assert_called_once()
+
+    assert data_dir.is_dir()
+
+
+@pytest.mark.usefixtures("test_repository", "tmp_supervisor_data")
+async def test_app_install_auth_failure(coresys: CoreSys):
+    """Test app install raises DockerRegistryAuthError on 401 with credentials."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    # Configure bad registry credentials
+    coresys.docker.config._data["registries"] = {  # pylint: disable=protected-access
+        "docker.io": {"username": "baduser", "password": "badpass"}
+    }
+
+    with (
+        patch.object(
+            DockerApp,
+            "install",
+            side_effect=DockerRegistryAuthError(registry="docker.io"),
+        ),
+        pytest.raises(DockerRegistryAuthError),
+    ):
+        await coresys.apps.install("local_example")
+
+    # Verify app data was cleaned up
+    assert "local_example" not in coresys.apps.local
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_app_update_auth_failure(coresys: CoreSys, install_app_example: App):
+    """Test app update raises DockerRegistryAuthError on 401 with credentials."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with (
+        patch.object(
+            DockerApp,
+            "update",
+            side_effect=DockerRegistryAuthError(registry="docker.io"),
+        ),
+        pytest.raises(DockerRegistryAuthError),
+    ):
+        await install_app_example.update()
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_app_rebuild_auth_failure(coresys: CoreSys, install_app_example: App):
+    """Test app rebuild raises DockerRegistryAuthError on 401 with credentials."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+
+    with (
+        patch.object(DockerApp, "remove"),
+        patch.object(
+            DockerApp,
+            "install",
+            side_effect=DockerRegistryAuthError(registry="docker.io"),
+        ),
+        pytest.raises(DockerRegistryAuthError),
+    ):
+        await install_app_example.rebuild()
+
+
+@pytest.mark.usefixtures("coresys", "path_extern")
+async def test_local_example_start(tmp_supervisor_data: Path, install_app_example: App):
+    """Test start of an app."""
+    install_app_example.path_data.mkdir()
+    await install_app_example.load()
+    await asyncio.sleep(0)
+    assert install_app_example.state == AppState.STOPPED
+
+    assert not (
+        app_config_dir := tmp_supervisor_data / "app_configs" / "local_example"
+    ).exists()
+
+    await install_app_example.start()
+
+    assert app_config_dir.is_dir()
+
+
+@pytest.mark.usefixtures("coresys", "tmp_supervisor_data")
+async def test_local_example_ingress_port_set(install_app_example: App):
+    """Test start of an app."""
+    install_app_example.path_data.mkdir()
+    await install_app_example.load()
+
+    assert install_app_example.ingress_port != 0
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_ports_merge_config_defaults_with_user_overrides(install_app_ssh: App):
+    """Test custom ports don't hide config-declared ports left unpublished."""
+    app = install_app_ssh
+    # Simulate a multi-port add-on (e.g. NGINX proxy) with optional ports
+    app.data[ATTR_PORTS] = {"22/tcp": None, "443/tcp": 443, "443/udp": None}
+
+    # Without user customization the config ports are returned as-is
+    assert app.ports == {"22/tcp": None, "443/tcp": 443, "443/udp": None}
+
+    # Publishing a single port must not drop the other config-declared ports,
+    # otherwise they can no longer be enabled from the UI
+    app.ports = {"443/tcp": 8443}
+    assert app.ports == {"22/tcp": None, "443/tcp": 8443, "443/udp": None}
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_app_pulse_error(
+    coresys: CoreSys, install_app_example: App, caplog: pytest.LogCaptureFixture
+):
+    """Test error writing pulse config for app."""
+    with patch("supervisor.apps.app.Path.write_text", side_effect=(err := OSError())):
+        err.errno = errno.EBUSY
+        await install_app_example.write_pulse()
+
+        assert "can't write pulse/client.config" in caplog.text
+        assert coresys.core.healthy is True
+
+        caplog.clear()
+        err.errno = errno.EBADMSG
+        await install_app_example.write_pulse()
+
+        assert "can't write pulse/client.config" in caplog.text
+        assert coresys.core.healthy is False
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_long_description_bad_message(coresys: CoreSys, install_app_example: App):
+    """Test long_description raises AppFileReadError and marks unhealthy on EBADMSG."""
+    err = OSError()
+    err.errno = errno.EBADMSG
+    with (
+        patch("supervisor.apps.model.Path.exists", side_effect=err),
+        pytest.raises(AppFileReadError),
+    ):
+        await install_app_example.long_description()
+
+    assert coresys.core.healthy is False
+    assert UnhealthyReason.OSERROR_BAD_MESSAGE in coresys.resolution.unhealthy
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_long_description_other_oserror(
+    coresys: CoreSys, install_app_example: App
+):
+    """Test long_description raises AppFileReadError without unhealthy on other OSError."""
+    err = OSError()
+    err.errno = errno.EIO
+    with (
+        patch("supervisor.apps.model.Path.exists", side_effect=err),
+        pytest.raises(AppFileReadError),
+    ):
+        await install_app_example.long_description()
+
+    assert coresys.core.healthy is True
+
+
+@pytest.mark.usefixtures("tmp_supervisor_data")
+async def test_refresh_path_cache_bad_message(
+    coresys: CoreSys, install_app_example: App
+):
+    """Test refresh_path_cache raises AppFileReadError and marks unhealthy on EBADMSG."""
+    err = OSError()
+    err.errno = errno.EBADMSG
+    with (
+        patch("supervisor.apps.model.Path.exists", side_effect=err),
+        pytest.raises(AppFileReadError),
+    ):
+        await install_app_example.refresh_path_cache()
+
+    assert coresys.core.healthy is False
+    assert UnhealthyReason.OSERROR_BAD_MESSAGE in coresys.resolution.unhealthy
+
+
+@pytest.mark.usefixtures("coresys")
+def test_auto_update_available(install_app_example: App):
+    """Test auto update availability based on versions."""
+    assert install_app_example.auto_update is False
+    assert install_app_example.need_update is False
+    assert install_app_example.auto_update_available is False
+
+    with patch.object(
+        App, "version", new=PropertyMock(return_value=AwesomeVersion("1.0"))
+    ):
+        assert install_app_example.need_update is True
+        assert install_app_example.auto_update_available is False
+
+        install_app_example.auto_update = True
+        assert install_app_example.auto_update_available is True
+
+    with patch.object(
+        App, "version", new=PropertyMock(return_value=AwesomeVersion("0.9"))
+    ):
+        assert install_app_example.auto_update_available is False
+
+    with patch.object(
+        App, "version", new=PropertyMock(return_value=AwesomeVersion("test"))
+    ):
+        assert install_app_example.auto_update_available is False
+
+
+@pytest.mark.usefixtures("coresys")
+def test_advanced_flag_ignored(install_app_example: App):
+    """Ensure advanced flag in config is ignored."""
+    install_app_example.data[ATTR_ADVANCED] = True
+
+    assert install_app_example.advanced is False
+
+
+async def test_paths_cache(coresys: CoreSys, install_app_ssh: App):
+    """Test cache for key paths that may or may not exist."""
+    assert not install_app_ssh.with_logo
+    assert not install_app_ssh.with_icon
+    assert not install_app_ssh.with_changelog
+    assert not install_app_ssh.with_documentation
+
+    with (
+        patch("supervisor.apps.app.Path.exists", return_value=True),
+        patch("supervisor.store.repository.RepositoryLocal.update", return_value=True),
+    ):
+        await coresys.store.reload(coresys.store.get("local"))
+
+        assert install_app_ssh.with_logo
+        assert install_app_ssh.with_icon
+        assert install_app_ssh.with_changelog
+        assert install_app_ssh.with_documentation
+
+
+@pytest.mark.usefixtures("mock_amd64_arch_supported")
+async def test_app_loads_wrong_image(
+    coresys: CoreSys, install_app_ssh: App, container: DockerContainer
+):
+    """Test app is loaded with incorrect image for architecture."""
+    coresys.apps.data.save_data.reset_mock()
+    install_app_ssh.persist["image"] = "local/aarch64-addon-ssh"
+    assert install_app_ssh.image == "local/aarch64-addon-ssh"
+
+    with (
+        patch("pathlib.Path.is_file", return_value=True),
+        patch.object(
+            coresys.docker,
+            "run_command",
+            return_value=CommandReturn(0, ["Build successful"]),
+        ) as mock_run_command,
+        patch.object(
+            type(coresys.config),
+            "local_to_extern_path",
+            return_value=PurePath("/addon/path/on/host"),
+        ),
+    ):
+        await install_app_ssh.load()
+
+    container.delete.assert_called_with(force=True, v=True)
+    # one for removing the app, one for removing the app builder
+    assert coresys.docker.images.delete.call_count == 2
+
+    assert coresys.docker.images.delete.call_args_list[0] == call(
+        "local/aarch64-addon-ssh:latest", force=True
+    )
+    assert coresys.docker.images.delete.call_args_list[1] == call(
+        "local/aarch64-addon-ssh:9.2.1", force=True
+    )
+    mock_run_command.assert_called_once()
+    assert mock_run_command.call_args.args[0] == "docker"
+    assert mock_run_command.call_args.kwargs["tag"] == "1.0.0-cli"
+    command = mock_run_command.call_args.kwargs["command"]
+    assert is_in_list(
+        ["--platform", "linux/amd64"],
+        command,
+    )
+    assert is_in_list(
+        ["--tag", "local/amd64-addon-ssh:9.2.1"],
+        command,
+    )
+    assert install_app_ssh.image == "local/amd64-addon-ssh"
+    coresys.apps.data.save_data.assert_called_once()
+
+
+@pytest.mark.usefixtures("mock_amd64_arch_supported")
+async def test_app_loads_missing_image_build(coresys: CoreSys, install_app_ssh: App):
+    """Test build-required app surfaces a repair when image is missing on load."""
+    coresys.docker.images.inspect.side_effect = aiodocker.DockerError(
+        HTTPStatus.NOT_FOUND, {"message": "missing"}
+    )
+
+    with patch.object(
+        coresys.docker,
+        "run_command",
+        return_value=CommandReturn(0, ["Build successful"]),
+    ) as mock_run_command:
+        await install_app_ssh.load()
+
+    # Build-required apps must not run a build during load. A repair is
+    # raised so the resolution autofix loop handles it off the critical path.
+    mock_run_command.assert_not_called()
+    issue = Issue(
+        IssueType.MISSING_IMAGE, ContextType.ADDON, reference=install_app_ssh.slug
+    )
+    assert issue in coresys.resolution.issues
+    suggestions = coresys.resolution.suggestions_for_issue(issue)
+    assert any(s.type == SuggestionType.EXECUTE_REPAIR for s in suggestions)
+
+
+async def test_app_loads_missing_image_build_detached(
+    coresys: CoreSys, install_app_ssh: App
+):
+    """Test detached build app does not surface a (futile) rebuild repair."""
+    slug = install_app_ssh.slug
+    # Detach: drop the store representation so there is no source to build from.
+    coresys.store.data.apps.pop(slug)
+    coresys.apps.store.pop(slug, None)
+    assert install_app_ssh.is_detached
+    assert install_app_ssh.need_build
+
+    coresys.docker.images.inspect.side_effect = aiodocker.DockerError(
+        HTTPStatus.NOT_FOUND, {"message": "missing"}
+    )
+
+    with patch.object(
+        coresys.docker,
+        "run_command",
+        return_value=CommandReturn(0, ["Build successful"]),
+    ) as mock_run_command:
+        await install_app_ssh.load()
+
+    # No build attempted and no rebuild repair raised; removal is offered by
+    # the detached-app check instead.
+    mock_run_command.assert_not_called()
+    issue = Issue(IssueType.MISSING_IMAGE, ContextType.ADDON, reference=slug)
+    assert issue not in coresys.resolution.issues
+
+
+@pytest.mark.usefixtures("mock_amd64_arch_supported")
+async def test_app_loads_missing_image_pull(coresys: CoreSys, install_app_ssh: App):
+    """Test pullable app installs the missing image during load."""
+    install_app_ssh.data["image"] = "test/amd64-addon-ssh"
+    coresys.docker.images.inspect.side_effect = aiodocker.DockerError(
+        HTTPStatus.NOT_FOUND, {"message": "missing"}
+    )
+
+    with patch.object(DockerAPI, "pull_image") as mock_pull_image:
+        await install_app_ssh.load()
+
+    mock_pull_image.assert_called_once()
+    issue = Issue(
+        IssueType.MISSING_IMAGE, ContextType.ADDON, reference=install_app_ssh.slug
+    )
+    assert issue not in coresys.resolution.issues
+
+
+@pytest.mark.usefixtures("container", "mock_amd64_arch_supported")
+async def test_app_load_succeeds_with_docker_errors(
+    coresys: CoreSys, install_app_ssh: App, caplog: pytest.LogCaptureFixture
+):
+    """Docker errors during load should not raise and fail setup."""
+    issue = Issue(
+        IssueType.MISSING_IMAGE, ContextType.ADDON, reference=install_app_ssh.slug
+    )
+
+    # Build-required app with missing image: repair issue raised, no exception
+    coresys.docker.images.inspect.side_effect = aiodocker.DockerError(
+        HTTPStatus.NOT_FOUND, {"message": "missing"}
+    )
+    caplog.clear()
+    await install_app_ssh.load()
+    assert issue in coresys.resolution.issues
+
+    # Pull-based app where check_image's internal install fails: addon left
+    # detached, no exception escapes to abort setup. The next load will hit
+    # DockerNotFound and trigger the proper repair path.
+    stored = coresys.resolution.get_issue_if_present(issue)
+    coresys.resolution.dismiss_issue(stored)
+    install_app_ssh.data["image"] = "test/amd64-addon-ssh"
+    caplog.clear()
+    with patch.object(
+        DockerAPI,
+        "pull_image",
+        side_effect=aiodocker.DockerError(400, {"message": "error"}),
+    ):
+        await install_app_ssh.load()
+    assert "Docker error loading app local_ssh, leaving detached" in caplog.text
+    assert any(
+        "Docker error loading app local_ssh" in r.message and r.levelname == "CRITICAL"
+        for r in caplog.records
+    )
+
+
+@pytest.mark.usefixtures("coresys")
+async def test_app_manual_only_boot(install_app_example: App):
+    """Test an app with manual only boot mode."""
+    assert install_app_example.boot_config == "manual_only"
+    assert install_app_example.boot == "manual"
+
+    # Users cannot change boot mode of an app with manual forced so changing boot isn't realistic
+    # However boot mode can change on update and user may have set auto before, ensure it is ignored
+    install_app_example.boot = "auto"
+    assert install_app_example.boot == "manual"
+
+
+@pytest.mark.parametrize(
+    ("initial_state", "target_state", "issue", "suggestions"),
+    [
+        (
+            AppState.ERROR,
+            AppState.STARTED,
+            BOOT_FAIL_ISSUE,
+            [suggestion.type for suggestion in BOOT_FAIL_SUGGESTIONS],
+        ),
+        (
+            AppState.STARTED,
+            AppState.STOPPED,
+            Issue(
+                IssueType.DEVICE_ACCESS_MISSING,
+                ContextType.ADDON,
+                reference=TEST_ADDON_SLUG,
+            ),
+            [SuggestionType.EXECUTE_RESTART],
+        ),
+        (
+            AppState.ERROR,
+            AppState.STARTED,
+            Issue(
+                IssueType.APP_PORT_CONFLICT,
+                ContextType.ADDON,
+                reference=TEST_ADDON_SLUG,
+                reference_extra={"port": 2222},
+            ),
+            [SuggestionType.CLEAR_PORT_CONFIG, SuggestionType.EXECUTE_START],
+        ),
+    ],
+)
+async def test_app_state_dismisses_issue(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    initial_state: AppState,
+    target_state: AppState,
+    issue: Issue,
+    suggestions: list[SuggestionType],
+):
+    """Test an app state change dismisses the issues."""
+    force_app_state(install_app_ssh, initial_state)
+    coresys.resolution.add_issue(issue, suggestions)
+
+    force_app_state(install_app_ssh, target_state)
+    assert coresys.resolution.issues == []
+    assert coresys.resolution.suggestions == []
+
+
+async def test_app_disable_boot_dismisses_boot_fail(
+    coresys: CoreSys, install_app_ssh: App
+):
+    """Test a disabling boot dismisses the boot fail issue."""
+    install_app_ssh.boot = AppBoot.AUTO
+    force_app_state(install_app_ssh, AppState.ERROR)
+    coresys.resolution.add_issue(
+        BOOT_FAIL_ISSUE, [suggestion.type for suggestion in BOOT_FAIL_SUGGESTIONS]
+    )
+
+    install_app_ssh.boot = AppBoot.MANUAL
+    assert coresys.resolution.issues == []
+    assert coresys.resolution.suggestions == []
+
+
+@pytest.mark.parametrize(
+    ("docker_message", "port"),
+    [
+        (
+            "failed to set up container networking: driver failed programming external connectivity on endpoint app_local_ssh (ea4d0fdaa72cf86f2c9199a04208e3eaf0c5a0d6fd34b3c7f4fab2daadb1f3a9): failed to bind host port for 0.0.0.0:2222:172.30.33.4:22/tcp: address already in use",
+            2222,
+        ),
+        (
+            "failed to set up container networking: driver failed programming external connectivity on endpoint app_local_ssh (ea4d0fdaa72cf86f2c9199a04208e3eaf0c5a0d6fd34b3c7f4fab2daadb1f3a9): Bind for 0.0.0.0:2222 failed: port is already allocated",
+            2222,
+        ),
+        (
+            "failed to set up container networking: driver failed programming external connectivity on endpoint app_local_ssh (ea4d0fdaa72cf86f2c9199a04208e3eaf0c5a0d6fd34b3c7f4fab2daadb1f3a9): failed to bind host port 0.0.0.0:2222/tcp: address already in use",
+            2222,
+        ),
+    ],
+)
+@pytest.mark.usefixtures(
+    "container", "mock_amd64_arch_supported", "path_extern", "tmp_supervisor_data"
+)
+async def test_app_start_port_conflict_error(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    caplog: pytest.LogCaptureFixture,
+    docker_message: str,
+    port: int,
+):
+    """Test port conflict error when trying to start app."""
+    install_app_ssh.data["image"] = "test/amd64-addon-ssh"
+    install_app_ssh.persist["network"] = {"22/tcp": port}
+    coresys.docker.containers.create.return_value.start.side_effect = (
+        aiodocker.DockerError(HTTPStatus.INTERNAL_SERVER_ERROR, docker_message)
+    )
+    await install_app_ssh.load()
+
+    caplog.clear()
+    with (
+        patch.object(App, "write_options"),
+        pytest.raises(
+            AppPortConflict,
+            check=lambda exc: exc.extra_fields == {"name": "local_ssh", "port": port},
+        ),
+    ):
+        await install_app_ssh.start()
+
+    assert (
+        f"Cannot start container app_local_ssh because port {port} is already in use"
+        in caplog.text
+    )
+
+    assert any(
+        issue.type == IssueType.APP_PORT_CONFLICT
+        and issue.context == ContextType.ADDON
+        and issue.reference == install_app_ssh.slug
+        and issue.reference_extra == {"port": port}
+        for issue in coresys.resolution.issues
+    )
+    assert any(
+        suggestion.type == SuggestionType.CLEAR_PORT_CONFIG
+        and suggestion.context == ContextType.ADDON
+        and suggestion.reference == install_app_ssh.slug
+        and suggestion.reference_extra == {"port": port}
+        for suggestion in coresys.resolution.suggestions
+    )
+    assert any(
+        suggestion.type == SuggestionType.EXECUTE_START
+        and suggestion.context == ContextType.ADDON
+        and suggestion.reference == install_app_ssh.slug
+        and suggestion.reference_extra == {"port": port}
+        for suggestion in coresys.resolution.suggestions
+    )
+
+
+@pytest.mark.usefixtures(
+    "container", "mock_amd64_arch_supported", "path_extern", "tmp_supervisor_data"
+)
+async def test_app_restart_port_conflict_creates_issue(
+    coresys: CoreSys,
+    install_app_ssh: App,
+):
+    """Test restart path creates conflict issue and suggestion when port is explicit."""
+    port = 2222
+    docker_message = (
+        "failed to set up container networking: driver failed programming external "
+        "connectivity on endpoint app_local_ssh: failed to bind host port for "
+        "0.0.0.0:2222:172.30.33.4:22/tcp: address already in use"
+    )
+    install_app_ssh.data["image"] = "test/amd64-addon-ssh"
+    install_app_ssh.persist["network"] = {"22/tcp": port}
+    coresys.docker.containers.create.return_value.start.side_effect = (
+        aiodocker.DockerError(HTTPStatus.INTERNAL_SERVER_ERROR, docker_message)
+    )
+    await install_app_ssh.load()
+
+    with (
+        patch.object(App, "stop", AsyncMock()),
+        patch.object(App, "write_options"),
+        pytest.raises(
+            AppPortConflict,
+            check=lambda exc: exc.extra_fields == {"name": "local_ssh", "port": port},
+        ),
+    ):
+        await install_app_ssh.restart()
+
+    assert any(
+        issue.type == IssueType.APP_PORT_CONFLICT
+        and issue.context == ContextType.ADDON
+        and issue.reference == install_app_ssh.slug
+        and issue.reference_extra == {"port": port}
+        for issue in coresys.resolution.issues
+    )
+    assert any(
+        suggestion.type == SuggestionType.CLEAR_PORT_CONFIG
+        and suggestion.context == ContextType.ADDON
+        and suggestion.reference == install_app_ssh.slug
+        and suggestion.reference_extra == {"port": port}
+        for suggestion in coresys.resolution.suggestions
+    )
+    assert any(
+        suggestion.type == SuggestionType.EXECUTE_START
+        and suggestion.context == ContextType.ADDON
+        and suggestion.reference == install_app_ssh.slug
+        and suggestion.reference_extra == {"port": port}
+        for suggestion in coresys.resolution.suggestions
+    )
+
+
+@pytest.mark.usefixtures(
+    "container", "mock_amd64_arch_supported", "path_extern", "tmp_supervisor_data"
+)
+async def test_app_start_port_conflict_without_configured_ports(
+    coresys: CoreSys,
+    install_app_ssh: App,
+):
+    """Test port conflict during start with no configured ports suggests start only."""
+    port = 1234
+    docker_message = (
+        "failed to set up container networking: driver failed programming external "
+        "connectivity on endpoint app_local_ssh: failed to bind host port for "
+        "0.0.0.0:1234:172.30.33.4:1234/tcp: address already in use"
+    )
+    install_app_ssh.data["image"] = "test/amd64-addon-ssh"
+    install_app_ssh.data.pop(ATTR_PORTS, None)
+    install_app_ssh.persist.pop("network", None)
+    coresys.docker.containers.create.return_value.start.side_effect = (
+        aiodocker.DockerError(HTTPStatus.INTERNAL_SERVER_ERROR, docker_message)
+    )
+    await install_app_ssh.load()
+
+    with (
+        patch.object(App, "write_options"),
+        pytest.raises(
+            AppPortConflict,
+            check=lambda exc: exc.extra_fields == {"name": "local_ssh", "port": port},
+        ),
+    ):
+        await install_app_ssh.start()
+
+    assert any(
+        issue.type == IssueType.APP_PORT_CONFLICT
+        and issue.context == ContextType.ADDON
+        and issue.reference == install_app_ssh.slug
+        and issue.reference_extra == {"port": port}
+        for issue in coresys.resolution.issues
+    )
+    assert any(
+        suggestion.type == SuggestionType.EXECUTE_START
+        and suggestion.context == ContextType.ADDON
+        and suggestion.reference == install_app_ssh.slug
+        and suggestion.reference_extra == {"port": port}
+        for suggestion in coresys.resolution.suggestions
+    )
+    assert not any(
+        suggestion.type == SuggestionType.CLEAR_PORT_CONFIG
+        and suggestion.context == ContextType.ADDON
+        and suggestion.reference == install_app_ssh.slug
+        and suggestion.reference_extra == {"port": port}
+        for suggestion in coresys.resolution.suggestions
+    )
+
+
+async def test_create_port_conflict_issue_non_user_port_suggestion(
+    coresys: CoreSys, install_app_ssh: App
+):
+    """Test port conflict on non-user-mapped default port suggests clear+start."""
+    install_app_ssh.data[ATTR_PORTS] = {"80/tcp": 80, "22/tcp": None}
+    install_app_ssh.persist.pop("network", None)
+
+    install_app_ssh.create_port_conflict_issue(80)
+
+    assert any(
+        issue.type == IssueType.APP_PORT_CONFLICT
+        and issue.context == ContextType.ADDON
+        and issue.reference == install_app_ssh.slug
+        and issue.reference_extra == {"port": 80}
+        for issue in coresys.resolution.issues
+    )
+    assert any(
+        suggestion.type == SuggestionType.EXECUTE_START
+        and suggestion.context == ContextType.ADDON
+        and suggestion.reference == install_app_ssh.slug
+        and suggestion.reference_extra == {"port": 80}
+        for suggestion in coresys.resolution.suggestions
+    )
+    assert any(
+        suggestion.type == SuggestionType.CLEAR_PORT_CONFIG
+        and suggestion.context == ContextType.ADDON
+        and suggestion.reference == install_app_ssh.slug
+        and suggestion.reference_extra == {"port": 80}
+        for suggestion in coresys.resolution.suggestions
+    )
+
+
+async def test_path_location_derived_from_store(coresys: CoreSys, install_app_ssh: App):
+    """Test source location comes from the store, not the install snapshot."""
+    slug = install_app_ssh.slug
+    store_location = coresys.store.data.apps[slug][ATTR_LOCATION]
+
+    # location is no longer persisted; a stale value in the snapshot is ignored.
+    install_app_ssh.data[ATTR_LOCATION] = "/data/addons/git/stale/ssh"
+    assert install_app_ssh.path_location == Path(store_location)
+
+
+async def test_path_location_detached_raises(coresys: CoreSys, install_app_ssh: App):
+    """Test a detached app has no resolvable source location."""
+    slug = install_app_ssh.slug
+
+    # Simulate a removed/unloaded repository: drop the store representation.
+    coresys.store.data.apps.pop(slug)
+    coresys.apps.store.pop(slug, None)
+    assert install_app_ssh.is_detached
+
+    with pytest.raises(RuntimeError):
+        _ = install_app_ssh.path_location
+
+    # Asset accessors report absence instead of crashing.
+    assert install_app_ssh.with_icon is False
+    assert install_app_ssh.with_logo is False
+    assert install_app_ssh.with_changelog is False
+    assert install_app_ssh.with_documentation is False
+    assert await install_app_ssh.long_description() is None

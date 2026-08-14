@@ -1,0 +1,11 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Start Supervisor service
+# ==============================================================================
+# Use mimalloc as Python's object allocator by default. It is bundled in CPython
+# (3.13+), so no LD_PRELOAD or extra library is required, and it uses noticeably
+# less memory than the previously preloaded jemalloc. Override or disable via
+# PYTHONMALLOC, e.g. `PYTHONMALLOC=pymalloc` for the default allocator.
+export PYTHONMALLOC="${PYTHONMALLOC:-mimalloc}"
+
+exec python3 -m supervisor

@@ -1,0 +1,58 @@
+change-template: "- #$NUMBER $TITLE @$AUTHOR"
+sort-direction: ascending
+
+categories:
+  - title: ":boom: Breaking Changes"
+    label: "breaking-change"
+
+  - title: ":sparkles: New Features"
+    label: "new-feature"
+
+  - title: ":bug: Bug Fixes"
+    label: "bugfix"
+
+  - title: ":gem: Style"
+    label: "style"
+
+  - title: ":package: Refactor"
+    label: "refactor"
+
+  - title: ":rocket: Performance"
+    label: "performance"
+
+  - title: ":rotating_light: Test"
+    label: "test"
+
+  - title: ":hammer_and_wrench: Build"
+    label: "build"
+
+  - title: ":gear: CI"
+    label: "ci"
+
+  - title: ":recycle: Chore"
+    label: "chore"
+
+  - title: ":wastebasket: Revert"
+    label: "revert"
+
+  - title: ":arrow_up: Dependency Updates"
+    label: "dependencies"
+    collapse-after: 1
+
+include-labels:
+  - "breaking-change"
+  - "new-feature"
+  - "bugfix"
+  - "style"
+  - "refactor"
+  - "performance"
+  - "test"
+  - "build"
+  - "ci"
+  - "chore"
+  - "revert"
+  - "dependencies"
+
+template: |
+
+  $CHANGES

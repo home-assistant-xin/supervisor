@@ -1,0 +1,77 @@
+"""Test check free space fixup."""
+
+# pylint: disable=import-error,protected-access
+from unittest.mock import patch
+
+from supervisor.const import CoreState
+from supervisor.coresys import CoreSys
+from supervisor.resolution.checks.free_space import CheckFreeSpace
+from supervisor.resolution.const import ContextType, IssueType
+from supervisor.resolution.data import Issue
+
+
+async def test_base(coresys: CoreSys):
+    """Test check basics."""
+    free_space = CheckFreeSpace(coresys)
+    assert free_space.slug == "free_space"
+    assert free_space.enabled
+
+
+async def test_check(coresys: CoreSys):
+    """Test check."""
+    free_space = CheckFreeSpace(coresys)
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    assert len(coresys.resolution.issues) == 0
+
+    with patch("shutil.disk_usage", return_value=(42, 42, 3 * (1024.0**3))):
+        await free_space.run_check()
+
+    assert len(coresys.resolution.issues) == 0
+
+    with patch("shutil.disk_usage", return_value=(1, 1, 1)):
+        await free_space.run_check()
+
+    assert coresys.resolution.issues[-1].type == IssueType.FREE_SPACE
+    assert len(coresys.resolution.suggestions) == 0
+
+
+async def test_approve(coresys: CoreSys):
+    """Test check."""
+    free_space = CheckFreeSpace(coresys)
+    await coresys.core.set_state(CoreState.RUNNING)
+
+    with patch("shutil.disk_usage", return_value=(1, 1, 1)):
+        assert await free_space.approve_check(
+            Issue(IssueType.FREE_SPACE, ContextType.SYSTEM)
+        )
+
+    with patch("shutil.disk_usage", return_value=(42, 42, 3 * (1024.0**3))):
+        assert not await free_space.approve_check(
+            Issue(IssueType.FREE_SPACE, ContextType.SYSTEM)
+        )
+
+
+async def test_did_run(coresys: CoreSys):
+    """Test that the check ran as expected."""
+    free_space = CheckFreeSpace(coresys)
+    should_run = free_space.states
+    should_not_run = [state for state in CoreState if state not in should_run]
+    assert len(should_run) != 0
+    assert len(should_not_run) != 0
+
+    with patch(
+        "supervisor.resolution.checks.free_space.CheckFreeSpace.run_check",
+        return_value=None,
+    ) as check:
+        for state in should_run:
+            await coresys.core.set_state(state)
+            await free_space()
+            check.assert_called_once()
+            check.reset_mock()
+
+        for state in should_not_run:
+            await coresys.core.set_state(state)
+            await free_space()
+            check.assert_not_called()
+            check.reset_mock()

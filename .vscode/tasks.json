@@ -1,0 +1,111 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Supervisor",
+      "type": "shell",
+      "command": "supervisor_run",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run Supervisor CLI",
+      "type": "shell",
+      "command": "docker exec -ti hassio_cli /usr/bin/cli.sh",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Update Supervisor Panel",
+      "type": "shell",
+      "command": "LOKALISE_TOKEN='${input:localiseToken}' ./scripts/update-frontend.sh",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Pytest",
+      "type": "shell",
+      "command": "pytest --timeout=10 tests",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Ruff Check",
+      "type": "shell",
+      "command": "ruff check --fix supervisor tests",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Ruff Format",
+      "type": "shell",
+      "command": "ruff format supervisor tests",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Pylint",
+      "type": "shell",
+      "command": "pylint supervisor",
+      "dependsOn": ["Install all Requirements"],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      },
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "localiseToken",
+      "type": "promptString",
+      "description": "Paste your lokalise token to download frontend translations"
+    }
+  ]
+}

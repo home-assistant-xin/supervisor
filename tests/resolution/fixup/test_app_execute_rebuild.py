@@ -1,0 +1,126 @@
+"""Test fixup core execute rebuild."""
+
+import asyncio
+from collections.abc import Callable, Coroutine
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import aiodocker
+from aiodocker.containers import DockerContainer
+import pytest
+
+from supervisor.apps.app import App
+from supervisor.coresys import CoreSys
+from supervisor.docker.interface import DockerInterface
+from supervisor.docker.manager import DockerAPI
+from supervisor.resolution.const import ContextType, IssueType, SuggestionType
+from supervisor.resolution.fixups.app_execute_rebuild import FixupAppExecuteRebuild
+
+
+def make_mock_container_get(
+    status: str,
+) -> Callable[[str], Coroutine[Any, Any, DockerContainer]]:
+    """Make mock of container get."""
+    out = MagicMock(spec=DockerContainer)
+    out.status = status
+    out.show.return_value = {"State": {"Status": status, "ExitCode": 0}, "Mounts": []}
+
+    async def mock_container_get(name) -> DockerContainer:
+        return out
+
+    return mock_container_get
+
+
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_fixup(docker: DockerAPI, coresys: CoreSys):
+    """Test fixup rebuilds app's container."""
+    docker.containers.get = make_mock_container_get("running")
+
+    app_execute_rebuild = FixupAppExecuteRebuild(coresys)
+
+    assert app_execute_rebuild.auto is False
+
+    coresys.resolution.create_issue(
+        IssueType.DOCKER_CONFIG,
+        ContextType.ADDON,
+        reference="local_ssh",
+        suggestions=[SuggestionType.EXECUTE_REBUILD],
+    )
+    with patch.object(App, "restart", return_value=asyncio.sleep(0)) as restart:
+        await app_execute_rebuild()
+        restart.assert_called_once()
+
+    assert not coresys.resolution.issues
+    assert not coresys.resolution.suggestions
+
+
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_fixup_stopped_core(
+    docker: DockerAPI, coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test fixup just removes app's container when it is stopped."""
+    caplog.clear()
+    docker.containers.get = make_mock_container_get("stopped")
+    app_execute_rebuild = FixupAppExecuteRebuild(coresys)
+
+    coresys.resolution.create_issue(
+        IssueType.DOCKER_CONFIG,
+        ContextType.ADDON,
+        reference="local_ssh",
+        suggestions=[SuggestionType.EXECUTE_REBUILD],
+    )
+    with patch.object(App, "restart") as restart:
+        await app_execute_rebuild()
+        restart.assert_not_called()
+
+    assert not coresys.resolution.issues
+    assert not coresys.resolution.suggestions
+    (await docker.containers.get("app_local_ssh")).delete.assert_called_once_with(
+        force=True, v=True
+    )
+    assert "App local_ssh is stopped" in caplog.text
+
+
+@pytest.mark.usefixtures("install_app_ssh")
+async def test_fixup_unknown_core(
+    docker: DockerAPI, coresys: CoreSys, caplog: pytest.LogCaptureFixture
+):
+    """Test fixup does nothing if app's container has already been removed."""
+    caplog.clear()
+    docker.containers.get.side_effect = aiodocker.DockerError(
+        404, {"message": "missing"}
+    )
+    app_execute_rebuild = FixupAppExecuteRebuild(coresys)
+
+    coresys.resolution.create_issue(
+        IssueType.DOCKER_CONFIG,
+        ContextType.ADDON,
+        reference="local_ssh",
+        suggestions=[SuggestionType.EXECUTE_REBUILD],
+    )
+    with (
+        patch.object(App, "restart") as restart,
+        patch.object(DockerInterface, "stop") as stop,
+    ):
+        await app_execute_rebuild()
+        restart.assert_not_called()
+        stop.assert_not_called()
+
+    assert not coresys.resolution.issues
+    assert not coresys.resolution.suggestions
+    assert "Container for app local_ssh does not exist" in caplog.text
+
+
+async def test_fixup_app_removed(coresys: CoreSys, caplog: pytest.LogCaptureFixture):
+    """Test fixup does nothing if app has been removed."""
+    caplog.clear()
+    app_execute_rebuild = FixupAppExecuteRebuild(coresys)
+
+    coresys.resolution.create_issue(
+        IssueType.DOCKER_CONFIG,
+        ContextType.ADDON,
+        reference="local_ssh",
+        suggestions=[SuggestionType.EXECUTE_REBUILD],
+    )
+    await app_execute_rebuild()
+    assert "Cannot rebuild app local_ssh as it is not installed" in caplog.text

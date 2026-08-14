@@ -1,0 +1,126 @@
+"""Main file for Supervisor."""
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import logging
+from pathlib import Path
+import sys
+
+import zlib_fast
+
+# Enable fast zlib before importing supervisor
+zlib_fast.enable()
+
+# pylint: disable=wrong-import-position
+from supervisor import bootstrap  # noqa: E402
+from supervisor.dbus.const import SystemState  # noqa: E402
+from supervisor.exceptions import HassioError  # noqa: E402
+from supervisor.utils.blockbuster import BlockBusterManager  # noqa: E402
+from supervisor.utils.logging import activate_log_queue_handler  # noqa: E402
+
+# pylint: enable=wrong-import-position
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+CONTAINER_OS_STARTUP_CHECK = Path("/run/os/startup-marker")
+
+
+def run_os_startup_check_cleanup() -> None:
+    """Cleanup OS startup check."""
+    if not CONTAINER_OS_STARTUP_CHECK.exists():
+        return
+
+    try:
+        CONTAINER_OS_STARTUP_CHECK.unlink()
+    except OSError as err:
+        _LOGGER.warning("Not able to remove the startup health file: %s", err)
+
+
+# pylint: disable=invalid-name
+if __name__ == "__main__":
+    bootstrap.initialize_logging()
+
+    # Init async event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Check if all information are available to setup Supervisor
+    bootstrap.check_environment()
+
+    # init executor pool
+    executor = ThreadPoolExecutor(thread_name_prefix="SyncWorker")
+    loop.set_default_executor(executor)
+
+    activate_log_queue_handler()
+
+    _LOGGER.info("Initializing Supervisor setup")
+    coresys = loop.run_until_complete(bootstrap.initialize_coresys())
+    loop.set_debug(coresys.config.debug)
+    if coresys.config.detect_blocking_io:
+        BlockBusterManager.activate()
+    loop.run_until_complete(coresys.core.connect())
+
+    loop.run_until_complete(bootstrap.supervisor_debugger(coresys))
+
+    # Signal health startup for container
+    run_os_startup_check_cleanup()
+
+    _LOGGER.info("Setting up Supervisor")
+    loop.run_until_complete(coresys.core.setup())
+
+    # Create startup task that can be cancelled gracefully
+    startup_task = loop.create_task(coresys.core.start())
+
+    async def host_is_shutting_down() -> bool:
+        """Return True if systemd is shutting the host down.
+
+        This relies only on the Systemd manager state, which is exposed by
+        every Systemd version, so it works regardless of the running HAOS
+        release (no dependency on OS-side units being present).
+        """
+        if not coresys.dbus.systemd.is_connected:
+            return False
+
+        try:
+            return await coresys.dbus.systemd.get_system_state() == SystemState.STOPPING
+        except HassioError as err:
+            _LOGGER.warning("Could not read systemd manager state: %s", err)
+            return False
+
+    async def stop_supervisor() -> None:
+        """Stop Supervisor, including managed services during host shutdown."""
+        try:
+            if await host_is_shutting_down():
+                _LOGGER.info("Host shutdown detected, shutting down managed services")
+                await coresys.core.shutdown()
+        finally:
+            await coresys.core.stop()
+
+    def shutdown_handler() -> None:
+        """Handle shutdown signals gracefully during startup."""
+        if not startup_task.done():
+            _LOGGER.warning("Supervisor startup interrupted by shutdown signal")
+            startup_task.cancel()
+
+        coresys.create_task(stop_supervisor())
+
+    bootstrap.register_signal_handlers(loop, shutdown_handler)
+
+    try:
+        loop.run_until_complete(startup_task)
+    except asyncio.CancelledError:
+        _LOGGER.warning("Supervisor startup cancelled")
+    except Exception as err:  # pylint: disable=broad-except
+        # Supervisor itself is running at this point, just something didn't
+        # start as expected. Log with traceback to get more insights for
+        # such cases.
+        _LOGGER.critical("Supervisor start failed: %s", err, exc_info=True)
+
+    try:
+        _LOGGER.info("Running Supervisor")
+        loop.run_forever()
+    finally:
+        loop.close()
+
+    _LOGGER.info("Closing Supervisor")
+    sys.exit(coresys.core.exit_code)

@@ -1,0 +1,92 @@
+"""Provide the MQTT Service."""
+
+import logging
+from typing import Any
+
+import voluptuous as vol
+
+from ...apps.app import App
+from ...exceptions import ServiceAlreadyProvidedError, ServiceNotProvidedError
+from ...validate import migrate_addon_to_app, network_port
+from ..const import (
+    ATTR_APP,
+    ATTR_HOST,
+    ATTR_PASSWORD,
+    ATTR_PORT,
+    ATTR_PROTOCOL,
+    ATTR_SSL,
+    ATTR_USERNAME,
+    SERVICE_MQTT,
+)
+from ..interface import ServiceInterface
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+# pylint: disable=no-value-for-parameter
+SCHEMA_SERVICE_MQTT = vol.Schema(
+    {
+        vol.Required(ATTR_HOST): str,
+        vol.Required(ATTR_PORT): network_port,
+        vol.Optional(ATTR_USERNAME): str,
+        vol.Optional(ATTR_PASSWORD): str,
+        vol.Optional(ATTR_SSL, default=False): vol.Boolean(),
+        vol.Optional(ATTR_PROTOCOL, default="3.1.1"): vol.All(
+            str, vol.In(["3.1", "3.1.1"])
+        ),
+    }
+)
+
+# 'addon' field deprecated as of 2026.05, replaced by 'app'
+SCHEMA_CONFIG_MQTT = vol.All(
+    migrate_addon_to_app, SCHEMA_SERVICE_MQTT.extend({vol.Required(ATTR_APP): str})
+)
+
+
+class MQTTService(ServiceInterface):
+    """Provide MQTT services."""
+
+    @property
+    def slug(self) -> str:
+        """Return slug of this service."""
+        return SERVICE_MQTT
+
+    @property
+    def _data(self) -> dict[str, Any]:
+        """Return data of this service."""
+        return self.sys_services.data.mqtt
+
+    @property
+    def schema(self) -> vol.Schema:
+        """Return data schema of this service."""
+        return SCHEMA_SERVICE_MQTT
+
+    @property
+    def active(self) -> list[str]:
+        """Return list of app slug they have enable that."""
+        if not self.enabled:
+            return []
+        return [self._data[ATTR_APP]]
+
+    async def set_service_data(self, app: App, data: dict[str, Any]) -> None:
+        """Write the data into service object."""
+        if self.enabled:
+            raise ServiceAlreadyProvidedError(
+                _LOGGER.debug,
+                service=SERVICE_MQTT,
+                app=self._data[ATTR_APP],
+            )
+
+        self._data.update(data)
+        self._data[ATTR_APP] = app.slug
+
+        _LOGGER.info("Set %s as service provider for mqtt", app.slug)
+        await self.save()
+
+    async def del_service_data(self, app: App) -> None:
+        """Remove the data from service object."""
+        if not self.enabled:
+            raise ServiceNotProvidedError(_LOGGER.debug, service=SERVICE_MQTT)
+
+        self._data.clear()
+        await self.save()

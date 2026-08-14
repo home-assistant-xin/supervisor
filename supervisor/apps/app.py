@@ -1,0 +1,1864 @@
+"""Init file for Supervisor apps."""
+
+import asyncio
+from collections.abc import Awaitable
+from contextlib import suppress
+from copy import deepcopy
+from datetime import datetime
+from functools import partial
+from ipaddress import IPv4Address
+import logging
+from pathlib import Path, PurePath
+import re
+import secrets
+import shutil
+import tarfile
+from tempfile import TemporaryDirectory
+from typing import Any, Final, Literal, cast
+
+import aiohttp
+from awesomeversion import AwesomeVersion, AwesomeVersionCompareException
+from deepmerge import Merger
+from securetar import AddFileError, SecureTarFile, atomic_contents_add
+import voluptuous as vol
+from voluptuous.humanize import humanize_error
+
+from ..bus import EventListener
+from ..const import (
+    ATTR_ACCESS_TOKEN,
+    ATTR_AUDIO_INPUT,
+    ATTR_AUDIO_OUTPUT,
+    ATTR_AUTO_UPDATE,
+    ATTR_BOOT,
+    ATTR_IMAGE,
+    ATTR_INGRESS_ENTRY,
+    ATTR_INGRESS_PANEL,
+    ATTR_INGRESS_PORT,
+    ATTR_INGRESS_TOKEN,
+    ATTR_LOCATION,
+    ATTR_NETWORK,
+    ATTR_OPTIONS,
+    ATTR_PORTS,
+    ATTR_PROTECTED,
+    ATTR_SCHEMA,
+    ATTR_SLUG,
+    ATTR_STATE,
+    ATTR_SYSTEM,
+    ATTR_SYSTEM_MANAGED,
+    ATTR_SYSTEM_MANAGED_CONFIG_ENTRY,
+    ATTR_USER,
+    ATTR_UUID,
+    ATTR_VERSION,
+    ATTR_VERSION_TIMESTAMP,
+    ATTR_WATCHDOG,
+    DNS_SUFFIX,
+    AppBoot,
+    AppBootConfig,
+    AppStartup,
+    AppState,
+    BusEvent,
+)
+from ..coresys import CoreSys
+from ..docker.app import DockerApp
+from ..docker.const import EXIT_CODE_SIGTERM_DEFAULT, ContainerState
+from ..docker.manager import ExecReturn
+from ..docker.monitor import DockerContainerStateEvent
+from ..docker.stats import DockerStats
+from ..exceptions import (
+    AppBackupMetadataInvalidError,
+    AppBuildFailedUnknownError,
+    AppConfigurationInvalidError,
+    AppNotRunningError,
+    AppNotSupportedError,
+    AppNotSupportedWriteStdinError,
+    AppPortConflict,
+    AppPrePostBackupCommandReturnedError,
+    AppsError,
+    AppsJobError,
+    AppUnknownError,
+    BackupInvalidError,
+    BackupRestoreUnknownError,
+    ConfigurationFileError,
+    DockerBuildError,
+    DockerContainerPortConflict,
+    DockerError,
+    DockerNotFound,
+    DockerRegistryAuthError,
+    HostAppArmorError,
+    StoreAppNotFoundError,
+)
+from ..hardware.data import Device
+from ..homeassistant.const import WSEvent
+from ..jobs.const import JobConcurrency, JobThrottle
+from ..jobs.decorator import Job
+from ..resolution.const import ContextType, IssueType, SuggestionType
+from ..resolution.data import Issue
+from ..store.app import AppStore
+from ..utils import check_port
+from ..utils.apparmor import adjust_profile
+from ..utils.dt import utc_from_timestamp
+from ..utils.json import read_json_file, write_json_file
+from ..utils.sentry import async_capture_exception
+from .const import (
+    WATCHDOG_MAX_ATTEMPTS,
+    WATCHDOG_RETRY_SECONDS,
+    WATCHDOG_THROTTLE_MAX_CALLS,
+    WATCHDOG_THROTTLE_PERIOD,
+    AppBackupMode,
+    MappingType,
+)
+from .model import AppModel, Data
+from .options import AppOptions
+from .utils import remove_data
+from .validate import SCHEMA_APP_BACKUP
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+RE_WEBUI = re.compile(
+    r"^(?:(?P<s_prefix>https?)|\[PROTO:(?P<t_proto>\w+)\])"
+    r":\/\/\[HOST\]:\[PORT:(?P<t_port>\d+)\](?P<s_suffix>.*)$"
+)
+
+RE_WATCHDOG = re.compile(
+    r"^(?:(?P<s_prefix>https?|tcp)|\[PROTO:(?P<t_proto>\w+)\])"
+    r":\/\/\[HOST\]:(?:\[PORT:)?(?P<t_port>\d+)\]?(?P<s_suffix>.*)$"
+)
+
+WATCHDOG_TIMEOUT = aiohttp.ClientTimeout(total=10)
+STARTUP_TIMEOUT = 120
+
+_OPTIONS_MERGER: Final = Merger(
+    type_strategies=[(dict, ["merge"])],
+    fallback_strategies=["override"],
+    type_conflict_strategies=["override"],
+)
+
+# Backups just need to know if an app was running or not
+# Map other app states to those two
+_MAP_APP_STATE = {
+    AppState.STARTUP: AppState.STARTED,
+    AppState.ERROR: AppState.STOPPED,
+    AppState.UNKNOWN: AppState.STOPPED,
+}
+
+
+class App(AppModel):
+    """Hold data for app inside Supervisor."""
+
+    def __init__(self, coresys: CoreSys, slug: str):
+        """Initialize data holder."""
+        super().__init__(coresys, slug)
+        self.instance: DockerApp = DockerApp(coresys, self)
+        # Last observed container state; None until first event arrives.
+        self._container_state: ContainerState | None = None
+        # Cached app state. Updated only via ``_update_state`` so the value
+        # consumers see matches what was last emitted.
+        self._state: AppState = AppState.UNKNOWN
+        self._manual_stop: bool = False
+        self._listeners: list[EventListener] = []
+        self._startup_event = asyncio.Event()
+        self._wait_for_startup_task: asyncio.Task | None = None
+        self._boot_failed_issue = Issue(
+            IssueType.BOOT_FAIL, ContextType.ADDON, reference=self.slug
+        )
+        self._device_access_missing_issue = Issue(
+            IssueType.DEVICE_ACCESS_MISSING, ContextType.ADDON, reference=self.slug
+        )
+
+    def __repr__(self) -> str:
+        """Return internal representation."""
+        return f"<Addon: {self.slug}>"
+
+    @property
+    def boot_failed_issue(self) -> Issue:
+        """Get issue used if start on boot failed."""
+        return self._boot_failed_issue
+
+    @property
+    def device_access_missing_issue(self) -> Issue:
+        """Get issue used if device access is missing and can't be automatically added."""
+        return self._device_access_missing_issue
+
+    @property
+    def state(self) -> AppState:
+        """Return current state of the app."""
+        return self._state
+
+    def _derive_state(self, operation_error: bool) -> AppState:
+        """Derive the app state from the cached docker signals.
+
+        Falls back to install signals when no container has been observed
+        yet: an attached instance (image present) is STOPPED, otherwise
+        UNKNOWN. ``operation_error`` forces ERROR for start/stop failures
+        that the docker event stream cannot reflect (e.g. the container
+        never came up).
+        """
+        if operation_error:
+            return AppState.ERROR
+        match self._container_state:
+            case ContainerState.RUNNING:
+                return (
+                    AppState.STARTUP if self.instance.healthcheck else AppState.STARTED
+                )
+            case ContainerState.HEALTHY | ContainerState.UNHEALTHY:
+                return AppState.STARTED
+            case ContainerState.STOPPED:
+                return AppState.STOPPED
+            case ContainerState.FAILED:
+                return AppState.ERROR
+            case _:
+                # No container observed (None) or container missing (UNKNOWN):
+                # fall back to install status.
+                return AppState.STOPPED if self.instance.attached else AppState.UNKNOWN
+
+    def _update_state(
+        self,
+        *,
+        container_state: ContainerState | None = None,
+        operation_error: bool = False,
+    ) -> None:
+        """Update the cached container state and emit a transition if it changed.
+
+        Re-derives the app state and emits side effects if it differs from
+        the cached state. ``container_state=None`` leaves the last observed
+        container state untouched. ``operation_error`` is a momentary signal
+        forcing ERROR for the current transition; a later container
+        observation supersedes it via the default.
+        """
+        if container_state is not None:
+            self._container_state = container_state
+
+        new_state = self._derive_state(operation_error)
+        if new_state == self._state:
+            return
+        old_state = self._state
+        self._state = new_state
+
+        # Signal listeners about app state change
+        if new_state == AppState.STARTED or old_state == AppState.STARTUP:
+            self._startup_event.set()
+
+        # Dismiss boot failed or port conflict issue if present and we started
+        if new_state == AppState.STARTED:
+            for issue in self.sys_resolution.issues:
+                if (
+                    issue == self.boot_failed_issue
+                    or issue.type == IssueType.APP_PORT_CONFLICT
+                    and issue.context == ContextType.ADDON
+                    and issue.reference == self.slug
+                ):
+                    self.sys_resolution.dismiss_issue(issue)
+
+        # Dismiss device access missing issue if present and we stopped
+        if new_state == AppState.STOPPED and (
+            access_issue := self.sys_resolution.get_issue_if_present(
+                self.device_access_missing_issue
+            )
+        ):
+            self.sys_resolution.dismiss_issue(access_issue)
+
+        self.sys_homeassistant.websocket.supervisor_event_custom(
+            WSEvent.ADDON,
+            {
+                ATTR_SLUG: self.slug,
+                ATTR_STATE: new_state,
+            },
+        )
+
+    @property
+    def in_progress(self) -> bool:
+        """Return True if a task is in progress."""
+        return self.instance.in_progress
+
+    async def load(self) -> None:
+        """Async initialize of object."""
+        self._manual_stop = (
+            await self.sys_hardware.helper.last_boot() != self.sys_config.last_boot
+        )
+
+        self._listeners.append(
+            self.sys_bus.register_event(
+                BusEvent.DOCKER_CONTAINER_STATE_CHANGE, self.container_state_changed
+            )
+        )
+        self._listeners.append(
+            self.sys_bus.register_event(
+                BusEvent.DOCKER_CONTAINER_STATE_CHANGE, self.watchdog_container
+            )
+        )
+
+        await self._check_ingress_port()
+
+        if (self.has_deprecated_arch and not self.has_supported_arch) or (
+            self.has_deprecated_machine and not self.has_supported_machine
+        ):
+            self.sys_resolution.create_issue(
+                IssueType.DEPRECATED_ARCH_ADDON,
+                ContextType.ADDON,
+                reference=self.slug,
+                suggestions=[SuggestionType.EXECUTE_REMOVE],
+            )
+            with suppress(DockerError):
+                await self.instance.attach(version=self.version)
+                self._update_state(container_state=await self.instance.current_state())
+            return
+
+        default_image = self._image(self.data)
+        try:
+            await self.instance.attach(version=self.version)
+
+            # Ensure we are using correct image for this system
+            await self.instance.check_image(self.version, default_image, self.arch)
+        except DockerNotFound:
+            _LOGGER.info("No %s app Docker image %s found", self.slug, self.image)
+            if self.need_build and self.is_detached:
+                # Image is gone and there is no store source to rebuild from.
+                # A rebuild repair would be futile; the detached-app check
+                # surfaces a remove suggestion instead.
+                _LOGGER.warning(
+                    "App %s is missing its image and is detached from its store; "
+                    "it cannot be rebuilt and should be removed",
+                    self.slug,
+                )
+            elif self.need_build:
+                # Don't run a local build during setup. Surface a repair so
+                # the resolution autofix loop can handle it off the critical
+                # path.
+                self._create_missing_image_issue()
+            else:
+                try:
+                    await self.instance.install(
+                        self.version, default_image, arch=self.arch
+                    )
+                except DockerError, AppNotSupportedError:
+                    self._create_missing_image_issue()
+        except DockerError as err:
+            # Docker error other than a clean "image not found" - we can't
+            # tell whether the image is actually missing. Log so the issue
+            # is visible (CRITICAL is captured by the Sentry integration)
+            # and leave the app detached; the user can attempt a manual
+            # rebuild from the app page.
+            _LOGGER.critical(
+                "Docker error loading app %s, leaving detached: %s", self.slug, err
+            )
+
+        self.persist[ATTR_IMAGE] = default_image
+        await self.save_persist()
+
+        # Settle the cached state from the attached container (UNKNOWN when
+        # only an image is present, which derives to STOPPED). attach() emits
+        # its runtime event asynchronously, so query synchronously here rather
+        # than racing that event during load.
+        with suppress(DockerError):
+            self._update_state(container_state=await self.instance.current_state())
+
+    def _create_missing_image_issue(self) -> None:
+        """Surface a repair suggestion for a missing app image."""
+        self.sys_resolution.create_issue(
+            IssueType.MISSING_IMAGE,
+            ContextType.ADDON,
+            reference=self.slug,
+            suggestions=[SuggestionType.EXECUTE_REPAIR],
+        )
+
+    @property
+    def ip_address(self) -> IPv4Address:
+        """Return IP of app instance."""
+        return self.instance.ip_address
+
+    @property
+    def data(self) -> Data:
+        """Return app data/config."""
+        return self.sys_apps.data.system[self.slug]
+
+    @property
+    def data_store(self) -> Data:
+        """Return app data from store."""
+        return self.sys_store.data.apps.get(self.slug, self.data)
+
+    @property
+    def app_store(self) -> AppStore | None:
+        """Return store representation of app."""
+        return self.sys_apps.store.get(self.slug)
+
+    @property
+    def persist(self) -> Data:
+        """Return app data/config."""
+        return self.sys_apps.data.user[self.slug]
+
+    @property
+    def is_installed(self) -> bool:
+        """Return True if an app is installed."""
+        return True
+
+    @property
+    def is_detached(self) -> bool:
+        """Return True if app is detached."""
+        return self.slug not in self.sys_store.data.apps
+
+    @property
+    def with_icon(self) -> bool:
+        """Return True if an icon exists."""
+        # A detached app has no store source to read assets from.
+        return self.app_store is not None and self.app_store.with_icon
+
+    @property
+    def with_logo(self) -> bool:
+        """Return True if a logo exists."""
+        return self.app_store is not None and self.app_store.with_logo
+
+    @property
+    def with_changelog(self) -> bool:
+        """Return True if a changelog exists."""
+        return self.app_store is not None and self.app_store.with_changelog
+
+    @property
+    def with_documentation(self) -> bool:
+        """Return True if a documentation exists."""
+        return self.app_store is not None and self.app_store.with_documentation
+
+    @property
+    def available(self) -> bool:
+        """Return True if this app is available on this platform."""
+        return self._available(self.data_store)
+
+    @property
+    def version(self) -> AwesomeVersion:
+        """Return installed version."""
+        return self.persist[ATTR_VERSION]
+
+    @property
+    def need_update(self) -> bool:
+        """Return True if an update is available."""
+        if self.is_detached:
+            return False
+        return self.version != self.latest_version
+
+    @property
+    def dns(self) -> list[str]:
+        """Return list of DNS name for that app."""
+        return [f"{self.hostname}.{DNS_SUFFIX}"]
+
+    @property
+    def options(self) -> dict[str, Any]:
+        """Return options with local changes."""
+        return _OPTIONS_MERGER.merge(
+            deepcopy(self.data[ATTR_OPTIONS]), deepcopy(self.persist[ATTR_OPTIONS])
+        )
+
+    @options.setter
+    def options(self, value: dict[str, Any] | None) -> None:
+        """Store user app options."""
+        self.persist[ATTR_OPTIONS] = {} if value is None else deepcopy(value)
+
+    @property
+    def boot(self) -> AppBoot:
+        """Return boot config with prio local settings unless config is forced."""
+        if self.boot_config == AppBootConfig.MANUAL_ONLY:
+            return super().boot
+        return self.persist.get(ATTR_BOOT, super().boot)
+
+    @boot.setter
+    def boot(self, value: AppBoot) -> None:
+        """Store user boot options."""
+        self.persist[ATTR_BOOT] = value
+
+        # Dismiss boot failed issue if present and boot at start disabled
+        if value == AppBoot.MANUAL and (
+            issue := self.sys_resolution.get_issue_if_present(self._boot_failed_issue)
+        ):
+            self.sys_resolution.dismiss_issue(issue)
+
+    @property
+    def auto_update(self) -> bool:
+        """Return if auto update is enable."""
+        return self.persist.get(ATTR_AUTO_UPDATE, False)
+
+    @auto_update.setter
+    def auto_update(self, value: bool) -> None:
+        """Set auto update."""
+        self.persist[ATTR_AUTO_UPDATE] = value
+
+    @property
+    def auto_update_available(self) -> bool:
+        """Return if it is safe to auto update app."""
+        if not self.need_update or not self.auto_update:
+            return False
+
+        for version in self.breaking_versions:
+            try:
+                # Must update to latest so if true update crosses a breaking version
+                if self.version < version:
+                    return False
+            except AwesomeVersionCompareException:
+                # If version scheme changed, we may get compare exception
+                # If latest version >= breaking version then assume update will
+                # cross it as the version scheme changes
+                # If both versions have compare exception, ignore as its in the past
+                with suppress(AwesomeVersionCompareException):
+                    if self.latest_version >= version:
+                        return False
+
+        return True
+
+    @property
+    def watchdog(self) -> bool:
+        """Return True if watchdog is enable."""
+        return self.persist[ATTR_WATCHDOG]
+
+    @watchdog.setter
+    def watchdog(self, value: bool) -> None:
+        """Set watchdog enable/disable."""
+        if value and self.startup == AppStartup.ONCE:
+            _LOGGER.warning(
+                "Ignoring watchdog for %s because startup type is 'once'", self.slug
+            )
+        else:
+            self.persist[ATTR_WATCHDOG] = value
+
+    @property
+    def system_managed(self) -> bool:
+        """Return True if app is managed by Home Assistant."""
+        return self.persist[ATTR_SYSTEM_MANAGED]
+
+    @system_managed.setter
+    def system_managed(self, value: bool) -> None:
+        """Set system managed enable/disable."""
+        if not value and self.system_managed_config_entry:
+            self.system_managed_config_entry = None
+
+        self.persist[ATTR_SYSTEM_MANAGED] = value
+
+    @property
+    def system_managed_config_entry(self) -> str | None:
+        """Return id of config entry managing this app (if any)."""
+        if not self.system_managed:
+            return None
+        return self.persist.get(ATTR_SYSTEM_MANAGED_CONFIG_ENTRY)
+
+    @system_managed_config_entry.setter
+    def system_managed_config_entry(self, value: str | None) -> None:
+        """Set ID of config entry managing this app."""
+        if not self.system_managed:
+            _LOGGER.warning(
+                "Ignoring system managed config entry for %s because it is not system managed",
+                self.slug,
+            )
+        else:
+            self.persist[ATTR_SYSTEM_MANAGED_CONFIG_ENTRY] = value
+
+    @property
+    def uuid(self) -> str:
+        """Return an API token for this app."""
+        return self.persist[ATTR_UUID]
+
+    @property
+    def supervisor_token(self) -> str | None:
+        """Return access token for Supervisor API."""
+        return self.persist.get(ATTR_ACCESS_TOKEN)
+
+    @property
+    def ingress_token(self) -> str | None:
+        """Return access token for Supervisor API."""
+        return self.persist.get(ATTR_INGRESS_TOKEN)
+
+    @property
+    def ingress_entry(self) -> str | None:
+        """Return ingress external URL."""
+        if self.with_ingress:
+            return f"/api/hassio_ingress/{self.ingress_token}"
+        return None
+
+    @property
+    def latest_version(self) -> AwesomeVersion:
+        """Return version of app."""
+        return self.data_store[ATTR_VERSION]
+
+    @property
+    def latest_version_timestamp(self) -> datetime:
+        """Return when latest version was first seen."""
+        return utc_from_timestamp(self.data_store[ATTR_VERSION_TIMESTAMP])
+
+    @property
+    def protected(self) -> bool:
+        """Return if app is in protected mode."""
+        return self.persist[ATTR_PROTECTED]
+
+    @protected.setter
+    def protected(self, value: bool) -> None:
+        """Set app in protected mode."""
+        self.persist[ATTR_PROTECTED] = value
+
+    @property
+    def ports(self) -> dict[str, int | None] | None:
+        """Return effective ports, merging user overrides over config defaults.
+
+        This keeps every config-declared port visible even when the user only
+        remapped a subset, so optional ports left unpublished (and ports newly
+        added by an app update) stay visible and keep applying their defaults.
+        """
+        config_ports = super().ports
+        if config_ports is None:
+            return self.persist.get(ATTR_NETWORK)
+
+        persisted = self.persist.get(ATTR_NETWORK, {})
+        return {
+            container_port: persisted.get(container_port, default_host_port)
+            for container_port, default_host_port in config_ports.items()
+        }
+
+    @ports.setter
+    def ports(self, value: dict[str, int | None] | None) -> None:
+        """Set custom ports of app."""
+        if value is None:
+            self.persist.pop(ATTR_NETWORK, None)
+            return
+
+        # Secure map ports to value
+        new_ports = {}
+        for container_port, host_port in value.items():
+            if container_port in self.data.get(ATTR_PORTS, {}):
+                new_ports[container_port] = host_port
+
+        self.persist[ATTR_NETWORK] = new_ports
+
+    def user_ports(self) -> dict[str, int | None]:
+        """Return only the user's persisted port overrides.
+
+        Unlike ``ports`` this excludes config defaults the user never touched,
+        so callers persisting a change only write back real user overrides.
+        """
+        return dict(self.persist.get(ATTR_NETWORK) or {})
+
+    @property
+    def ingress_url(self) -> str | None:
+        """Return URL to ingress url."""
+        if not self.with_ingress:
+            return None
+
+        url = f"/api/hassio_ingress/{self.ingress_token}/"
+        if ATTR_INGRESS_ENTRY in self.data:
+            return f"{url}{self.data[ATTR_INGRESS_ENTRY]}"
+        return url
+
+    @property
+    def webui(self) -> str | None:
+        """Return URL to webui or None."""
+        url = super().webui
+        if not url or not (webui := RE_WEBUI.match(url)):
+            return None
+
+        # extract arguments
+        t_port = webui.group("t_port")
+        t_proto = webui.group("t_proto")
+        s_prefix = webui.group("s_prefix") or ""
+        s_suffix = webui.group("s_suffix") or ""
+
+        # search host port for this docker port
+        if self.ports is None:
+            port = t_port
+        else:
+            port = self.ports.get(f"{t_port}/tcp", t_port)
+
+        # lookup the correct protocol from config
+        if t_proto:
+            proto = "https" if self.options.get(t_proto) else "http"
+        else:
+            proto = s_prefix
+
+        return f"{proto}://[HOST]:{port}{s_suffix}"
+
+    @property
+    def ingress_port(self) -> int | None:
+        """Return Ingress port."""
+        if not self.with_ingress:
+            return None
+
+        port = self.data[ATTR_INGRESS_PORT]
+        if port == 0:
+            raise RuntimeError(f"No port set for app {self.slug}")
+        return port
+
+    @property
+    def ingress_panel(self) -> bool | None:
+        """Return True if the app access support ingress."""
+        if not self.with_ingress:
+            return None
+
+        return self.persist[ATTR_INGRESS_PANEL]
+
+    @ingress_panel.setter
+    def ingress_panel(self, value: bool) -> None:
+        """Return True if the app access support ingress."""
+        self.persist[ATTR_INGRESS_PANEL] = value
+
+    @property
+    def audio_output(self) -> str | None:
+        """Return a pulse profile for output or None."""
+        if not self.with_audio:
+            return None
+        return self.persist.get(ATTR_AUDIO_OUTPUT)
+
+    @audio_output.setter
+    def audio_output(self, value: str | None):
+        """Set audio output profile settings."""
+        self.persist[ATTR_AUDIO_OUTPUT] = value
+
+    @property
+    def audio_input(self) -> str | None:
+        """Return pulse profile for input or None."""
+        if not self.with_audio:
+            return None
+
+        return self.persist.get(ATTR_AUDIO_INPUT)
+
+    @audio_input.setter
+    def audio_input(self, value: str | None) -> None:
+        """Set audio input settings."""
+        self.persist[ATTR_AUDIO_INPUT] = value
+
+    @property
+    def image(self) -> str | None:
+        """Return image name of app."""
+        return self.persist.get(ATTR_IMAGE)
+
+    @property
+    def need_build(self) -> bool:
+        """Return True if this  app need a local build."""
+        return ATTR_IMAGE not in self.data
+
+    @property
+    def latest_need_build(self) -> bool:
+        """Return True if the latest version of the app needs a local build."""
+        return ATTR_IMAGE not in self.data_store
+
+    @property
+    def path_location(self) -> Path:
+        """Return path to this app's source, resolved from the store.
+
+        The source location is owned by the store and recomputed on every store
+        reload, so it is derived here instead of being persisted (which used to
+        go stale, e.g. after the addons->apps path migration). It only exists
+        for a store-backed app: callers must ensure the app is attached (the
+        store is loaded before apps during setup, see Core.setup ordering).
+        Reaching here without a store representation is a programming error.
+        """
+        if self.app_store is None:
+            raise RuntimeError(
+                f"App {self.slug} has no source location: not available in the "
+                "store (detached, or store accessed before it was loaded)"
+            )
+        return Path(self.app_store.data[ATTR_LOCATION])
+
+    @property
+    def path_data(self) -> Path:
+        """Return app data path inside Supervisor."""
+        return Path(self.sys_config.path_apps_data, self.slug)
+
+    @property
+    def path_extern_data(self) -> PurePath:
+        """Return app data path external for Docker."""
+        return PurePath(self.sys_config.path_extern_apps_data, self.slug)
+
+    @property
+    def app_config_used(self) -> bool:
+        """App is using its public config folder."""
+        return (
+            MappingType.APP_CONFIG in self.map_volumes
+            or MappingType.ADDON_CONFIG in self.map_volumes
+        )
+
+    @property
+    def path_config(self) -> Path:
+        """Return app config path inside Supervisor."""
+        return Path(self.sys_config.path_app_configs, self.slug)
+
+    @property
+    def path_extern_config(self) -> PurePath:
+        """Return app config path external for Docker."""
+        return PurePath(self.sys_config.path_extern_app_configs, self.slug)
+
+    @property
+    def path_options(self) -> Path:
+        """Return path to app options."""
+        return Path(self.path_data, "options.json")
+
+    @property
+    def path_pulse(self) -> Path:
+        """Return path to asound config."""
+        return Path(self.sys_config.path_tmp, f"{self.slug}_pulse")
+
+    @property
+    def path_extern_pulse(self) -> Path:
+        """Return path to asound config for Docker."""
+        return Path(self.sys_config.path_extern_tmp, f"{self.slug}_pulse")
+
+    @property
+    def devices(self) -> set[Device]:
+        """Extract devices from app options."""
+        options_schema = self.schema
+        with suppress(vol.Invalid):
+            options_schema.validate(self.options)
+
+        return options_schema.devices
+
+    @property
+    def pwned(self) -> set[str]:
+        """Extract pwned data for app options."""
+        options_schema = self.schema
+        with suppress(vol.Invalid):
+            options_schema.validate(self.options)
+
+        return options_schema.pwned
+
+    @property
+    def loaded(self) -> bool:
+        """Is app loaded."""
+        return bool(self._listeners)
+
+    async def save_persist(self) -> None:
+        """Save data of app."""
+        await self.sys_apps.data.save_data()
+
+    async def watchdog_application(self) -> bool:
+        """Return True if application is running."""
+        url = self.watchdog_url
+        if not url or not (application := RE_WATCHDOG.match(url)):
+            return True
+
+        # extract arguments
+        t_port = int(application.group("t_port"))
+        t_proto = application.group("t_proto")
+        s_prefix = application.group("s_prefix") or ""
+        s_suffix = application.group("s_suffix") or ""
+
+        # search host port for this docker port
+        if self.host_network and self.ports:
+            port = self.ports.get(f"{t_port}/tcp")
+            if port is None:
+                port = t_port
+        else:
+            port = t_port
+
+        # TCP monitoring
+        if s_prefix == "tcp":
+            return await check_port(self.ip_address, port)
+
+        # lookup the correct protocol from config
+        if t_proto:
+            proto = "https" if self.options.get(t_proto) else "http"
+        else:
+            proto = s_prefix
+
+        # Make HTTP request
+        try:
+            url = f"{proto}://{self.ip_address}:{port}{s_suffix}"
+            async with self.sys_websession.get(
+                url, timeout=WATCHDOG_TIMEOUT, ssl=False
+            ) as req:
+                if req.status < 300:
+                    return True
+        except TimeoutError, aiohttp.ClientError:
+            pass
+
+        return False
+
+    async def write_options(self) -> None:
+        """Return True if app options is written to data."""
+        # Update secrets for validation
+        await self.sys_homeassistant.secrets.reload()
+
+        try:
+            options = self.schema.validate(self.options)
+            await self.sys_run_in_executor(write_json_file, self.path_options, options)
+        except vol.Invalid as ex:
+            raise AppConfigurationInvalidError(
+                _LOGGER.error,
+                app=self.slug,
+                validation_error=humanize_error(self.options, ex),
+            ) from None
+        except ConfigurationFileError as err:
+            _LOGGER.error("App %s can't write options", self.slug)
+            raise AppUnknownError(app=self.slug) from err
+
+        _LOGGER.debug("App %s write options: %s", self.slug, options)
+
+    @Job(
+        name="app_unload",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def unload(self) -> None:
+        """Unload app and remove data."""
+        # Wait for startup wait task to complete before removing data.
+        # The container remove/state change resolves _startup_event; this
+        # ensures _wait_for_startup finishes before we touch app data.
+        if self._wait_for_startup_task:
+            await self._wait_for_startup_task
+
+        for listener in self._listeners:
+            self.sys_bus.remove_listener(listener)
+
+        def remove_data_dir():
+            if self.path_data.is_dir():
+                _LOGGER.info("Removing app data folder %s", self.path_data)
+                remove_data(self.path_data)
+
+        await self.sys_run_in_executor(remove_data_dir)
+
+    async def _check_ingress_port(self):
+        """Assign a ingress port if dynamic port selection is used."""
+        if not self.with_ingress:
+            return
+
+        if self.data[ATTR_INGRESS_PORT] == 0:
+            self.data[ATTR_INGRESS_PORT] = await self.sys_ingress.get_dynamic_port(
+                self.slug
+            )
+
+    @Job(
+        name="app_install",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def install(self) -> None:
+        """Install and setup this app."""
+        if not self.app_store:
+            raise StoreAppNotFoundError(app=self.slug)
+
+        await self.sys_apps.data.install(self.app_store)
+
+        def setup_data():
+            if not self.path_data.is_dir():
+                _LOGGER.info(
+                    "Creating Home Assistant app data folder %s", self.path_data
+                )
+                self.path_data.mkdir()
+
+        await self.sys_run_in_executor(setup_data)
+
+        # Setup/Fix AppArmor profile
+        await self.install_apparmor()
+
+        # Install image
+        try:
+            await self.instance.install(
+                self.latest_version, self.app_store.image, arch=self.arch
+            )
+        except AppsError:
+            await self.sys_apps.data.uninstall(self)
+            raise
+        except DockerBuildError as err:
+            _LOGGER.error("Could not build image for app %s: %s", self.slug, err)
+            await self.sys_apps.data.uninstall(self)
+            raise AppBuildFailedUnknownError(app=self.slug) from err
+        except DockerRegistryAuthError:
+            await self.sys_apps.data.uninstall(self)
+            raise
+        except DockerError as err:
+            _LOGGER.error("Could not pull image to update app %s: %s", self.slug, err)
+            await self.sys_apps.data.uninstall(self)
+            raise AppUnknownError(app=self.slug) from err
+
+        # Finish initialization and set up listeners
+        await self.load()
+
+        # Add to app manager
+        self.sys_apps.local[self.slug] = self
+
+        # Reload ingress tokens
+        if self.with_ingress:
+            await self.sys_ingress.reload()
+
+    @Job(
+        name="app_uninstall",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def uninstall(
+        self, *, remove_config: bool, remove_image: bool = True
+    ) -> None:
+        """Uninstall and cleanup this app."""
+        try:
+            await self.instance.remove(remove_image=remove_image)
+        except DockerError as err:
+            _LOGGER.error("Could not remove image for app %s: %s", self.slug, err)
+            raise AppUnknownError(app=self.slug) from err
+
+        # The container (and possibly the image) is gone; the state derives
+        # back to UNKNOWN via the image-removed instance.
+        self._update_state(container_state=ContainerState.UNKNOWN)
+
+        await self.unload()
+
+        def cleanup_config_and_audio():
+            # Remove config if present and requested
+            if self.app_config_used and remove_config:
+                remove_data(self.path_config)
+
+            # Cleanup audio settings
+            if self.path_pulse.exists():
+                with suppress(OSError):
+                    self.path_pulse.unlink()
+
+        await self.sys_run_in_executor(cleanup_config_and_audio)
+
+        # Cleanup AppArmor profile
+        with suppress(HostAppArmorError):
+            await self.uninstall_apparmor()
+
+        # Cleanup Ingress panel from sidebar
+        if self.ingress_panel:
+            self.ingress_panel = False
+            await self.sys_ingress.update_hass_panel(self)
+
+        # Cleanup Ingress dynamic port assignment
+        need_ingress_token_cleanup = False
+        if self.with_ingress:
+            need_ingress_token_cleanup = True
+            await self.sys_ingress.del_dynamic_port(self.slug)
+
+        # Cleanup discovery data
+        for message in self.sys_discovery.list_messages:
+            if message.app != self.slug:
+                continue
+            await self.sys_discovery.remove(message)
+
+        # Cleanup services data
+        for service in self.sys_services.list_services:
+            if self.slug not in service.active:
+                continue
+            await service.del_service_data(self)
+
+        # Remove from app manager
+        self.sys_apps.local.pop(self.slug)
+        await self.sys_apps.data.uninstall(self)
+
+        # Cleanup Ingress tokens
+        if need_ingress_token_cleanup:
+            await self.sys_ingress.reload()
+
+    @Job(
+        name="app_update",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def update(self) -> asyncio.Task | None:
+        """Update this app to latest version.
+
+        Returns a Task that completes when app has state 'started' (see start)
+        if it was running. Else nothing is returned.
+        """
+        if not self.app_store:
+            raise StoreAppNotFoundError(app=self.slug)
+
+        old_image = self.image
+        # Cache data to prevent races with other updates to global
+        store = self.app_store.clone()
+
+        try:
+            await self.instance.update(store.version, store.image, arch=self.arch)
+        except DockerBuildError as err:
+            _LOGGER.error("Could not build image for app %s: %s", self.slug, err)
+            raise AppBuildFailedUnknownError(app=self.slug) from err
+        except DockerRegistryAuthError:
+            raise
+        except DockerError as err:
+            _LOGGER.error("Could not pull image to update app %s: %s", self.slug, err)
+            raise AppUnknownError(app=self.slug) from err
+
+        # Stop the app if running
+        if (last_state := self.state) in {AppState.STARTED, AppState.STARTUP}:
+            await self.stop()
+
+        try:
+            _LOGGER.info("App '%s' successfully updated", self.slug)
+            await self.sys_apps.data.update(store)
+            await self._check_ingress_port()
+
+            # Reload ingress tokens in case app gained ingress support
+            if self.with_ingress:
+                await self.sys_ingress.reload()
+
+            # Cleanup
+            with suppress(DockerError):
+                await self.instance.cleanup(
+                    old_image=old_image, image=store.image, version=store.version
+                )
+
+            # Setup/Fix AppArmor profile
+            await self.install_apparmor()
+
+        finally:
+            # restore state. Return Task for caller if no exception
+            out = (
+                await self.start()
+                if last_state in {AppState.STARTED, AppState.STARTUP}
+                else None
+            )
+        return out
+
+    @Job(
+        name="app_rebuild",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def rebuild(self) -> asyncio.Task | None:
+        """Rebuild this apps container and image.
+
+        Returns a Task that completes when app has state 'started' (see start)
+        if it was running. Else nothing is returned.
+        """
+        last_state: AppState = self.state
+        try:
+            # remove docker container and image but not app config
+            try:
+                await self.instance.remove()
+            except DockerError as err:
+                _LOGGER.error("Could not remove image for app %s: %s", self.slug, err)
+                raise AppUnknownError(app=self.slug) from err
+
+            try:
+                await self.instance.install(self.version)
+            except DockerBuildError as err:
+                _LOGGER.error("Could not build image for app %s: %s", self.slug, err)
+                raise AppBuildFailedUnknownError(app=self.slug) from err
+            except DockerRegistryAuthError:
+                raise
+            except DockerError as err:
+                _LOGGER.error(
+                    "Could not pull image to update app %s: %s", self.slug, err
+                )
+                raise AppUnknownError(app=self.slug) from err
+
+            if self.app_store:
+                await self.sys_apps.data.update(self.app_store)
+
+            await self._check_ingress_port()
+
+            # Reload ingress tokens in case app gained ingress support
+            if self.with_ingress:
+                await self.sys_ingress.reload()
+
+            _LOGGER.info("App '%s' successfully rebuilt", self.slug)
+
+        finally:
+            # restore state
+            out = (
+                await self.start()
+                if last_state in [AppState.STARTED, AppState.STARTUP]
+                else None
+            )
+        return out
+
+    async def write_pulse(self) -> None:
+        """Write asound config to file and return True on success."""
+        pulse_config = self.sys_plugins.audio.pulse_client(
+            input_profile=self.audio_input, output_profile=self.audio_output
+        )
+
+        def write_pulse_config():
+            # Cleanup wrong maps
+            if self.path_pulse.is_dir():
+                shutil.rmtree(self.path_pulse, ignore_errors=True)
+            self.path_pulse.write_text(pulse_config, encoding="utf-8")
+
+        try:
+            await self.sys_run_in_executor(write_pulse_config)
+        except OSError as err:
+            self.sys_resolution.check_oserror(err)
+            _LOGGER.error("App %s can't write pulse/client.config: %s", self.slug, err)
+        else:
+            _LOGGER.debug(
+                "App %s write pulse/client.config: %s", self.slug, self.path_pulse
+            )
+
+    async def install_apparmor(self) -> None:
+        """Install or Update AppArmor profile for App."""
+        exists_local = self.sys_host.apparmor.exists(self.slug)
+        exists_app = await self.sys_run_in_executor(self.path_apparmor.exists)
+
+        # Nothing to do
+        if not exists_local and not exists_app:
+            return
+
+        # Need removed
+        if exists_local and not exists_app:
+            await self.sys_host.apparmor.remove_profile(self.slug)
+            return
+
+        # Need install/update
+        tmp_folder: TemporaryDirectory | None = None
+
+        def install_update_profile() -> Path:
+            nonlocal tmp_folder
+            tmp_folder = TemporaryDirectory(dir=self.sys_config.path_tmp)
+            profile_file = Path(tmp_folder.name, "apparmor.txt")
+            adjust_profile(self.slug, self.path_apparmor, profile_file)
+            return profile_file
+
+        try:
+            profile_file = await self.sys_run_in_executor(install_update_profile)
+            await self.sys_host.apparmor.load_profile(self.slug, profile_file)
+        finally:
+            if tmp_folder:
+                await self.sys_run_in_executor(tmp_folder.cleanup)
+
+    async def uninstall_apparmor(self) -> None:
+        """Remove AppArmor profile for App."""
+        if not self.sys_host.apparmor.exists(self.slug):
+            return
+        await self.sys_host.apparmor.remove_profile(self.slug)
+
+    def test_update_schema(self) -> bool:
+        """Check if the existing configuration is valid after update."""
+        # load next schema
+        new_raw_schema = self.data_store[ATTR_SCHEMA]
+        default_options = self.data_store[ATTR_OPTIONS]
+
+        # if disabled
+        if isinstance(new_raw_schema, bool):
+            return True
+
+        # merge options
+        options = _OPTIONS_MERGER.merge(
+            deepcopy(default_options), deepcopy(self.persist[ATTR_OPTIONS])
+        )
+
+        # create voluptuous
+        new_schema = vol.Schema(
+            vol.All(
+                dict, AppOptions(self.coresys, new_raw_schema, self.name, self.slug)
+            )
+        )
+
+        # validate
+        try:
+            new_schema(options)
+        except vol.Invalid:
+            _LOGGER.warning("App %s new schema is not compatible", self.slug)
+            return False
+        return True
+
+    async def _wait_for_startup(self) -> None:
+        """Wait for startup event to be set with timeout."""
+        try:
+            await asyncio.wait_for(self._startup_event.wait(), STARTUP_TIMEOUT)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Timeout while waiting for app %s to start, took more than %s seconds",
+                self.name,
+                STARTUP_TIMEOUT,
+            )
+        except asyncio.CancelledError as err:
+            _LOGGER.info("Wait for app startup task cancelled due to: %s", err)
+        finally:
+            if self._wait_for_startup_task is asyncio.current_task():
+                self._wait_for_startup_task = None
+
+    def create_port_conflict_issue(
+        self, port: int, source: Literal["core"] | None = None
+    ) -> None:
+        """Create a port conflict issue for the given port.
+
+        Source can only be "core" or None currently, may be extended in future.
+        If problematic port is mapped for this app (by user override or config
+        default), suggest clearing the mapping and then starting the app again.
+        Otherwise suggest starting the app again.
+        """
+        ports = self.ports or {}
+        suggestions = [SuggestionType.EXECUTE_START]
+        if any(public_port == port for public_port in ports.values()):
+            suggestions.insert(0, SuggestionType.CLEAR_PORT_CONFIG)
+
+        self.sys_resolution.create_issue(
+            IssueType.APP_PORT_CONFLICT,
+            ContextType.ADDON,
+            reference=self.slug,
+            reference_extra={"port": port},
+            suggestions=suggestions,
+        )
+
+    @Job(
+        name="app_start",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def start(self) -> asyncio.Task:
+        """Set options and start app.
+
+        Returns a Task that completes when app has state 'started'.
+        For apps with a healthcheck, that is when they become healthy or unhealthy.
+        Apps without a healthcheck have state 'started' immediately.
+        """
+        if await self.instance.is_running():
+            _LOGGER.warning("%s is already running!", self.slug)
+            if not self._wait_for_startup_task or self._wait_for_startup_task.done():
+                self._wait_for_startup_task = self.sys_create_task(
+                    self._wait_for_startup()
+                )
+            return self._wait_for_startup_task
+
+        # Access Token
+        self.persist[ATTR_ACCESS_TOKEN] = secrets.token_hex(56)
+        await self.save_persist()
+
+        # Options
+        await self.write_options()
+
+        # Sound
+        if self.with_audio:
+            await self.write_pulse()
+
+        def _check_app_config_dir():
+            if self.path_config.is_dir():
+                return
+
+            _LOGGER.info(
+                "Creating Home Assistant app config folder %s", self.path_config
+            )
+            self.path_config.mkdir()
+
+        if self.app_config_used:
+            await self.sys_run_in_executor(_check_app_config_dir)
+
+        # Start App
+        self._startup_event.clear()
+        try:
+            await self.instance.run()
+        except DockerContainerPortConflict as err:
+            port = cast(dict[str, Any], err.extra_fields)["port"]
+            self.create_port_conflict_issue(port)
+            raise AppPortConflict(_LOGGER.error, name=self.slug, port=port) from err
+        except DockerError as err:
+            _LOGGER.error("Could not start container for app %s: %s", self.slug, err)
+            self._update_state(operation_error=True)
+            raise AppUnknownError(app=self.slug) from err
+
+        self._wait_for_startup_task = self.sys_create_task(self._wait_for_startup())
+        return self._wait_for_startup_task
+
+    @Job(
+        name="app_stop",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def stop(self) -> None:
+        """Stop app."""
+        self._manual_stop = True
+        try:
+            await self.instance.stop()
+        except DockerError as err:
+            _LOGGER.error("Could not stop container for app %s: %s", self.slug, err)
+            self._update_state(operation_error=True)
+            raise AppUnknownError(app=self.slug) from err
+
+    @Job(
+        name="app_restart",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def restart(self) -> asyncio.Task:
+        """Restart app.
+
+        Returns a Task that completes when app has state 'started' (see start).
+        """
+        with suppress(AppsError):
+            await self.stop()
+        return await self.start()
+
+    def is_running(self) -> Awaitable[bool]:
+        """Return True if Docker container is running.
+
+        Return a coroutine.
+        """
+        return self.instance.is_running()
+
+    async def stats(self) -> DockerStats:
+        """Return stats of container."""
+        try:
+            if not await self.is_running():
+                raise AppNotRunningError(_LOGGER.warning, app=self.slug)
+
+            return await self.instance.stats()
+        except DockerError as err:
+            _LOGGER.error(
+                "Could not get stats of container for app %s: %s", self.slug, err
+            )
+            raise AppUnknownError(app=self.slug) from err
+
+    @Job(
+        name="app_write_stdin",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def write_stdin(self, data) -> None:
+        """Write data to app stdin."""
+        if not self.with_stdin:
+            raise AppNotSupportedWriteStdinError(_LOGGER.error, app=self.slug)
+
+        try:
+            if not await self.is_running():
+                raise AppNotRunningError(_LOGGER.warning, app=self.slug)
+
+            await self.instance.write_stdin(data)
+        except DockerError as err:
+            _LOGGER.error(
+                "Could not write stdin to container for app %s: %s", self.slug, err
+            )
+            raise AppUnknownError(app=self.slug) from err
+
+    async def _backup_command(self, command: str) -> None:
+        try:
+            command_return: ExecReturn = await self.instance.run_inside(command)
+            if command_return.exit_code != 0:
+                _LOGGER.debug(
+                    "Pre-/Post backup command failed with: %s",
+                    command_return.output.decode("utf-8", errors="replace"),
+                )
+                raise AppPrePostBackupCommandReturnedError(
+                    _LOGGER.error, app=self.slug, exit_code=command_return.exit_code
+                )
+        except DockerError as err:
+            _LOGGER.error(
+                "Failed running pre-/post backup command %s: %s", command, err
+            )
+            raise AppUnknownError(app=self.slug) from err
+
+    @Job(
+        name="app_begin_backup",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def begin_backup(self) -> bool:
+        """Execute pre commands or stop app if necessary.
+
+        Returns value of `is_running`. Caller should not call `end_backup` if return is false.
+        """
+        if not await self.is_running():
+            return False
+
+        if self.backup_mode == AppBackupMode.COLD:
+            _LOGGER.info("Shutdown app %s for cold backup", self.slug)
+            await self.stop()
+
+        elif self.backup_pre is not None:
+            await self._backup_command(self.backup_pre)
+
+        return True
+
+    @Job(
+        name="app_end_backup",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def end_backup(self) -> asyncio.Task | None:
+        """Execute post commands or restart app if necessary.
+
+        Returns a Task that completes when app has state 'started' (see start)
+        for cold backup. Else nothing is returned.
+        """
+        if self.backup_mode is AppBackupMode.COLD:
+            _LOGGER.info("Starting app %s again", self.slug)
+            return await self.start()
+
+        if self.backup_post is not None:
+            await self._backup_command(self.backup_post)
+        return None
+
+    def _is_excluded_by_filter(
+        self, origin_path: Path, arcname: str, item_arcpath: PurePath
+    ) -> bool:
+        """Filter out files from backup based on filters provided by app developer.
+
+        This tests the dev provided filters against the full path of the file as
+        Supervisor sees them using match. This is done for legacy reasons, testing
+        against the relative path makes more sense and may be changed in the future.
+        """
+        full_path = origin_path / item_arcpath.relative_to(arcname)
+
+        for exclude in self.backup_exclude:
+            if not full_path.match(exclude):
+                continue
+            _LOGGER.debug("Ignoring %s because of %s", full_path, exclude)
+            return True
+
+        return False
+
+    @Job(
+        name="app_backup",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def backup(self, tar_file: SecureTarFile) -> asyncio.Task | None:
+        """Backup state of an app.
+
+        Returns a Task that completes when app has state 'started' (see start)
+        for cold backup. Else nothing is returned.
+        """
+
+        def _app_backup(
+            metadata: dict[str, Any],
+            apparmor_profile: str | None,
+            app_config_used: bool,
+            temp_dir: TemporaryDirectory,
+            temp_path: Path,
+        ):
+            """Start the backup process."""
+            # Store local configs/state
+            try:
+                write_json_file(temp_path.joinpath("addon.json"), metadata)
+            except ConfigurationFileError as err:
+                _LOGGER.error("Can't save meta for %s: %s", self.slug, err)
+                raise BackupRestoreUnknownError from err
+
+            # Store AppArmor Profile
+            if apparmor_profile:
+                profile_backup_file = temp_path.joinpath("apparmor.txt")
+                try:
+                    self.sys_host.apparmor.backup_profile(
+                        apparmor_profile, profile_backup_file
+                    )
+                except HostAppArmorError as err:
+                    _LOGGER.error(
+                        "Can't backup AppArmor profile for %s: %s", self.slug, err
+                    )
+                    raise BackupRestoreUnknownError from err
+
+            # Write tarfile
+            with tar_file as backup:
+                # Backup metadata
+                backup.add(temp_dir.name, arcname=".")
+
+                # Backup data
+                atomic_contents_add(
+                    backup,
+                    self.path_data,
+                    file_filter=partial(
+                        self._is_excluded_by_filter, self.path_data, "data"
+                    ),
+                    arcname="data",
+                )
+
+                # Backup config (if used and existing, restore handles this gracefully)
+                if app_config_used and self.path_config.is_dir():
+                    atomic_contents_add(
+                        backup,
+                        self.path_config,
+                        file_filter=partial(
+                            self._is_excluded_by_filter, self.path_config, "config"
+                        ),
+                        arcname="config",
+                    )
+
+        wait_for_start: asyncio.Task | None = None
+
+        data = {
+            ATTR_USER: self.persist,
+            ATTR_SYSTEM: self.data,
+            ATTR_VERSION: self.version,
+            ATTR_STATE: _MAP_APP_STATE.get(self.state, self.state),
+        }
+        apparmor_profile = (
+            self.slug if self.sys_host.apparmor.exists(self.slug) else None
+        )
+
+        was_running = await self.begin_backup()
+        temp_dir = await self.sys_run_in_executor(
+            TemporaryDirectory, dir=self.sys_config.path_tmp
+        )
+        temp_path = Path(temp_dir.name)
+        _LOGGER.info("Building backup for app %s", self.slug)
+        try:
+            # store local image
+            if self.need_build:
+                await self.instance.export_image(temp_path.joinpath("image.tar"))
+
+            await self.sys_run_in_executor(
+                partial(
+                    _app_backup,
+                    metadata=data,
+                    apparmor_profile=apparmor_profile,
+                    app_config_used=self.app_config_used,
+                    temp_dir=temp_dir,
+                    temp_path=temp_path,
+                )
+            )
+            _LOGGER.info("Finish backup for app %s", self.slug)
+        except DockerError as err:
+            _LOGGER.error("Can't export image for app %s: %s", self.slug, err)
+            raise BackupRestoreUnknownError from err
+        except (tarfile.TarError, OSError, AddFileError) as err:
+            _LOGGER.error("Can't write backup tarfile for app %s: %s", self.slug, err)
+            raise BackupRestoreUnknownError from err
+        finally:
+            await self.sys_run_in_executor(temp_dir.cleanup)
+            if was_running:
+                wait_for_start = await self.end_backup()
+
+        return wait_for_start
+
+    @Job(
+        name="app_restore",
+        on_condition=AppsJobError,
+        concurrency=JobConcurrency.GROUP_REJECT,
+    )
+    async def restore(self, tar_file: SecureTarFile) -> asyncio.Task | None:
+        """Restore state of an app.
+
+        Returns a Task that completes when app has state 'started' (see start)
+        if app is started after restore. Else nothing is returned.
+        """
+        wait_for_start: asyncio.Task | None = None
+
+        # Extract backup
+        def _extract_tarfile() -> tuple[TemporaryDirectory, dict[str, Any]]:
+            """Extract tar backup."""
+            tmp = TemporaryDirectory(dir=self.sys_config.path_tmp)
+            try:
+                with tar_file as backup:
+                    # The tar filter rejects path traversal and absolute names,
+                    # aborting restore of malicious backups with such exploits.
+                    backup.extractall(
+                        path=tmp.name,
+                        filter="tar",
+                    )
+
+                data = read_json_file(Path(tmp.name, "addon.json"))
+            except:
+                tmp.cleanup()
+                raise
+
+            return tmp, data
+
+        try:
+            tmp, data = await self.sys_run_in_executor(_extract_tarfile)
+        except tarfile.FilterError as err:
+            raise BackupInvalidError(
+                f"Can't extract backup tarfile for {self.slug}: {err}",
+                _LOGGER.error,
+            ) from err
+        except tarfile.TarError as err:
+            raise BackupRestoreUnknownError from err
+        except ConfigurationFileError as err:
+            raise AppUnknownError(app=self.slug) from err
+
+        try:
+            # Validate
+            try:
+                data = SCHEMA_APP_BACKUP(data)
+            except vol.Invalid as err:
+                raise AppBackupMetadataInvalidError(
+                    _LOGGER.error,
+                    app=self.slug,
+                    validation_error=humanize_error(data, err),
+                ) from err
+
+            # Validate availability. Raises if not
+            self._validate_availability(data[ATTR_SYSTEM], logger=_LOGGER.error)
+
+            # Restore local app information
+            _LOGGER.info("Restore config for app %s", self.slug)
+            restore_image = self._image(data[ATTR_SYSTEM])
+            await self.sys_apps.data.restore(
+                self.slug, data[ATTR_USER], data[ATTR_SYSTEM], restore_image
+            )
+
+            # Stop it first if its running
+            if await self.instance.is_running():
+                await self.stop()
+
+            try:
+                # Check version / restore image
+                version = data[ATTR_VERSION]
+                if not await self.instance.exists():
+                    _LOGGER.info("Restore/Install of image for app %s", self.slug)
+
+                    image_file = Path(tmp.name, "image.tar")
+                    if await self.sys_run_in_executor(image_file.is_file):
+                        with suppress(DockerError):
+                            await self.instance.import_image(image_file)
+                    else:
+                        with suppress(DockerError):
+                            await self.instance.install(
+                                version, restore_image, self.arch
+                            )
+                            await self.instance.cleanup()
+                elif self.instance.version != version or self.legacy:
+                    _LOGGER.info("Restore/Update of image for app %s", self.slug)
+                    with suppress(DockerError):
+                        await self.instance.update(version, restore_image, self.arch)
+                await self._check_ingress_port()
+
+                # Restore data and config
+                def _restore_data():
+                    """Restore data and config."""
+                    _LOGGER.info("Restoring data and config for app %s", self.slug)
+                    if self.path_data.is_dir():
+                        remove_data(self.path_data)
+                    if self.path_config.is_dir():
+                        remove_data(self.path_config)
+
+                    temp_data = Path(tmp.name, "data")
+                    if temp_data.is_dir():
+                        shutil.copytree(temp_data, self.path_data, symlinks=True)
+                    else:
+                        self.path_data.mkdir()
+
+                    temp_config = Path(tmp.name, "config")
+                    if temp_config.is_dir():
+                        shutil.copytree(temp_config, self.path_config, symlinks=True)
+                    elif self.app_config_used:
+                        self.path_config.mkdir()
+
+                try:
+                    await self.sys_run_in_executor(_restore_data)
+                except shutil.Error as err:
+                    _LOGGER.error(
+                        "Can't restore origin data for %s: %s", self.slug, err
+                    )
+                    raise BackupRestoreUnknownError from err
+
+                # Restore AppArmor
+                profile_file = Path(tmp.name, "apparmor.txt")
+                if await self.sys_run_in_executor(profile_file.exists):
+                    try:
+                        await self.sys_host.apparmor.load_profile(
+                            self.slug, profile_file
+                        )
+                    except HostAppArmorError as err:
+                        _LOGGER.error(
+                            "Can't restore AppArmor profile for app %s: %s",
+                            self.slug,
+                            err,
+                        )
+                        raise BackupRestoreUnknownError from err
+
+            finally:
+                # Is app loaded
+                if not self.loaded:
+                    await self.load()
+
+                # Run app
+                if data[ATTR_STATE] == AppState.STARTED:
+                    wait_for_start = await self.start()
+        finally:
+            await self.sys_run_in_executor(tmp.cleanup)
+        _LOGGER.info("Finished restore for app %s", self.slug)
+        return wait_for_start
+
+    @Job(
+        name="app_restart_after_problem",
+        throttle_period=WATCHDOG_THROTTLE_PERIOD,
+        throttle_max_calls=WATCHDOG_THROTTLE_MAX_CALLS,
+        on_condition=AppsJobError,
+        throttle=JobThrottle.GROUP_RATE_LIMIT,
+        internal=True,
+    )
+    async def _restart_after_problem(
+        self, state: ContainerState, exit_code: int | None = None
+    ):
+        """Restart unhealthy or failed app."""
+        attempts = 0
+        while await self.instance.current_state() == state:
+            if not self.in_progress:
+                if state == ContainerState.FAILED:
+                    _LOGGER.warning(
+                        "Watchdog found app %s exited with code %d, restarting...",
+                        self.name,
+                        exit_code,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Watchdog found app %s is %s, restarting...",
+                        self.name,
+                        state,
+                    )
+                try:
+                    if state == ContainerState.FAILED:
+                        # Ensure failed container is removed before attempting reanimation
+                        if attempts == 0:
+                            with suppress(DockerError):
+                                await self.instance.stop(remove_container=True)
+
+                        await (await self.start())
+                    else:
+                        await (await self.restart())
+                except AppPortConflict as err:
+                    _LOGGER.warning(
+                        "Watchdog cannot restart app %s: %s", self.name, err
+                    )
+                    break
+                except AppsError as err:
+                    attempts = attempts + 1
+                    _LOGGER.error("Watchdog restart of app %s failed!", self.name)
+                    await async_capture_exception(err)
+                else:
+                    break
+
+            if attempts >= WATCHDOG_MAX_ATTEMPTS:
+                _LOGGER.critical(
+                    "Watchdog cannot restart app %s, failed all %s attempts",
+                    self.name,
+                    attempts,
+                )
+                break
+
+            # Exponential backoff to spread retries over the throttle window
+            delay = WATCHDOG_RETRY_SECONDS * (1 << max(attempts - 1, 0))
+            _LOGGER.debug(
+                "Watchdog will retry app %s in %s seconds (attempt %s)",
+                self.name,
+                delay,
+                attempts + 1,
+            )
+            await asyncio.sleep(delay)
+
+    async def container_state_changed(self, event: DockerContainerStateEvent) -> None:
+        """Update cached container state and emit transitions."""
+        if event.name != self.instance.name:
+            return
+
+        if event.state == ContainerState.RUNNING:
+            self._manual_stop = False
+        elif event.state == ContainerState.FAILED:
+            if event.exit_code == EXIT_CODE_SIGTERM_DEFAULT:
+                _LOGGER.warning(
+                    "App %s did not handle SIGTERM and was terminated by the "
+                    "default signal handler (exit code %d). The app should "
+                    "trap SIGTERM, shut down cleanly, and exit with code 0. "
+                    "Please report this to the app developer.",
+                    self.name,
+                    EXIT_CODE_SIGTERM_DEFAULT,
+                )
+            elif event.exit_code is not None:
+                _LOGGER.error(
+                    "App %s exited with non-zero exit code %d",
+                    self.name,
+                    event.exit_code,
+                )
+
+        # An observed container state supersedes any prior operation error.
+        self._update_state(container_state=event.state)
+
+    async def watchdog_container(self, event: DockerContainerStateEvent) -> None:
+        """Process state changes in app container and restart if necessary."""
+        if event.name != self.instance.name:
+            return
+
+        # Skip watchdog if not enabled or manual stopped
+        if not self.watchdog or self._manual_stop:
+            return
+
+        if event.state in [
+            ContainerState.FAILED,
+            ContainerState.STOPPED,
+            ContainerState.UNHEALTHY,
+        ]:
+            await self._restart_after_problem(event.state, event.exit_code)
+
+    async def refresh_path_cache(self) -> None:
+        """Refresh cache of existing paths."""
+        # Asset paths live in the store source; a detached app has none.
+        if self.app_store:
+            await self.app_store.refresh_path_cache()

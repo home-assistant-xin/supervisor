@@ -1,0 +1,17 @@
+{
+  "raspberrypi3-64": ["aarch64"],
+  "raspberrypi4-64": ["aarch64"],
+  "raspberrypi5-64": ["aarch64"],
+  "yellow": ["aarch64"],
+  "green": ["aarch64"],
+  "odroid-c2": ["aarch64"],
+  "odroid-c4": ["aarch64"],
+  "odroid-m1": ["aarch64"],
+  "odroid-n2": ["aarch64"],
+  "khadas-vim3": ["aarch64"],
+  "generic-aarch64": ["aarch64"],
+  "qemux86-64": ["amd64"],
+  "qemuarm-64": ["aarch64"],
+  "intel-nuc": ["amd64"],
+  "generic-x86-64": ["amd64"]
+}

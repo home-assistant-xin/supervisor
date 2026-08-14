@@ -1,0 +1,12 @@
+{
+    "local": {
+        "name": "Local apps",
+        "url": "https://home-assistant.io/hassio",
+        "maintainer": "you"
+    },
+    "core": {
+        "name": "Official apps",
+        "url": "https://home-assistant.io/addons",
+        "maintainer": "Home Assistant"
+    }
+}

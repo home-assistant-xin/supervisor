@@ -1,0 +1,1 @@
+"""Resolution Supervisor module."""

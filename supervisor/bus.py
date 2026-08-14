@@ -1,0 +1,54 @@
+"""Bus event system."""
+
+from __future__ import annotations
+
+from asyncio import Task
+from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
+import logging
+from typing import Any
+
+from .const import BusEvent
+from .coresys import CoreSys, CoreSysAttributes
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True, frozen=True)
+class EventListener:
+    """Event listener."""
+
+    event_type: BusEvent
+    callback: Callable[[Any], Coroutine[Any, Any, None]]
+
+
+class Bus(CoreSysAttributes):
+    """Handle Bus event system."""
+
+    def __init__(self, coresys: CoreSys):
+        """Initialize bus backend."""
+        self.coresys = coresys
+        self._listeners: dict[BusEvent, list[EventListener]] = {}
+
+    def register_event(
+        self, event: BusEvent, callback: Callable[[Any], Coroutine[Any, Any, None]]
+    ) -> EventListener:
+        """Register callback for an event."""
+        listener = EventListener(event, callback)
+        self._listeners.setdefault(event, []).append(listener)
+        return listener
+
+    def fire_event(self, event: BusEvent, reference: Any) -> list[Task]:
+        """Fire an event to the bus."""
+        _LOGGER.debug("Fire event '%s' with '%s'", event, reference)
+        tasks: list[Task] = []
+        for listener in self._listeners.get(event, []):
+            tasks.append(self.sys_create_task(listener.callback(reference)))
+        return tasks
+
+    def remove_listener(self, listener: EventListener) -> None:
+        """Unregister an listener."""
+        try:
+            self._listeners[listener.event_type].remove(listener)
+        except ValueError, KeyError:
+            _LOGGER.warning("Listener %s not registered", listener)

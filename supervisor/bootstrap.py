@@ -1,0 +1,377 @@
+"""Bootstrap Supervisor."""
+
+# ruff: noqa: T100
+import asyncio
+from collections.abc import Callable
+import logging
+import os
+import signal
+import threading
+import warnings
+
+from colorlog import ColoredFormatter
+
+from .api import RestAPI
+from .apps.manager import AppManager
+from .arch import CpuArchManager
+from .auth import Auth
+from .backups.manager import BackupManager
+from .bus import Bus
+from .const import (
+    ENV_HOMEASSISTANT_REPOSITORY,
+    ENV_SUPERVISOR_MACHINE,
+    ENV_SUPERVISOR_NAME,
+    ENV_SUPERVISOR_SHARE,
+    SOCKET_DOCKER,
+    LogLevel,
+    UpdateChannel,
+)
+from .core import Core
+from .coresys import CoreSys
+from .dbus.manager import DBusManager
+from .discovery import Discovery
+from .docker.manager import DockerAPI
+from .hardware.manager import HardwareManager
+from .homeassistant.module import HomeAssistant
+from .host.manager import HostManager
+from .ingress import Ingress
+from .jobs import JobManager
+from .misc.scheduler import Scheduler
+from .misc.tasks import Tasks
+from .mounts.manager import MountManager
+from .os.manager import OSManager
+from .plugins.manager import PluginManager
+from .resolution.module import ResolutionManager
+from .security.module import Security
+from .services import ServiceManager
+from .store import StoreManager
+from .supervisor import Supervisor
+from .updater import Updater
+from .utils.sentry import capture_exception, init_sentry
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+async def initialize_coresys() -> CoreSys:
+    """Initialize supervisor coresys/objects."""
+    coresys = await CoreSys().load_config()
+
+    # Check if ENV is in development mode
+    if coresys.dev:
+        _LOGGER.warning("Environment variable 'SUPERVISOR_DEV' is set")
+        coresys.config.logging = LogLevel.DEBUG
+        coresys.config.debug = True
+        coresys.config.detect_blocking_io = True
+    else:
+        coresys.config.modify_log_level()
+
+    # Initialize core objects
+    coresys.docker = await DockerAPI(coresys).post_init()
+    coresys.resolution = await ResolutionManager(coresys).load_config()
+    await coresys.resolution.load_modules()
+    coresys.jobs = await JobManager(coresys).load_config()
+    coresys.core = await Core(coresys).post_init()
+    coresys.plugins = await PluginManager(coresys).load_config()
+    coresys.arch = CpuArchManager(coresys)
+    coresys.auth = await Auth(coresys).load_config()
+    coresys.updater = await Updater(coresys).load_config()
+    coresys.api = RestAPI(coresys)
+    coresys.supervisor = Supervisor(coresys)
+    coresys.homeassistant = await HomeAssistant(coresys).load_config()
+    coresys.apps = await AppManager(coresys).load_config()
+    coresys.backups = await BackupManager(coresys).load_config()
+    coresys.host = await HostManager(coresys).post_init()
+    coresys.hardware = await HardwareManager.create(coresys)
+    coresys.ingress = await Ingress(coresys).load_config()
+    coresys.tasks = Tasks(coresys)
+    coresys.services = await ServiceManager(coresys).load_config()
+    coresys.store = await StoreManager(coresys).load_config()
+    coresys.discovery = await Discovery(coresys).load_config()
+    coresys.dbus = DBusManager(coresys)
+    coresys.os = OSManager(coresys)
+    coresys.scheduler = Scheduler(coresys)
+    coresys.security = await Security(coresys).load_config()
+    coresys.bus = Bus(coresys)
+    coresys.mounts = await MountManager(coresys).load_config()
+
+    # Set Machine/Host ID
+    await coresys.init_machine()
+
+    # diagnostics
+    if coresys.config.diagnostics:
+        init_sentry(coresys)
+
+    # bootstrap config
+    def _bootstrap_config() -> None:
+        """Bootstrap config."""
+        _migrate_legacy_paths(coresys)
+        initialize_system(coresys)
+
+    await coresys.run_in_executor(_bootstrap_config)
+
+    if coresys.dev:
+        coresys.updater.channel = UpdateChannel.DEV
+
+    # Convert datetime
+    logging.Formatter.converter = lambda *args: coresys.now().timetuple()
+
+    return coresys
+
+
+def _migrate_legacy_paths(coresys: CoreSys) -> None:
+    """Rename legacy addon directories and config file to new app paths."""
+    config = coresys.config
+    supervisor = config.path_supervisor
+
+    # Migrate addons/{core,data,local,git} -> apps/{core,data,local,git}
+    apps_dir = supervisor / "apps"
+    migrations = [
+        (supervisor / "addons" / "core", config.path_apps_core),
+        (supervisor / "addons" / "data", config.path_apps_data),
+        (supervisor / "addons" / "local", config.path_apps_local),
+        (supervisor / "addons" / "git", config.path_apps_git),
+        (supervisor / "addon_configs", config.path_app_configs),
+    ]
+    needs_apps_dir = any(
+        old.is_dir() and not new.exists()
+        for old, new in migrations[:4]  # only the apps/ sub-dirs
+    )
+    if needs_apps_dir and not apps_dir.is_dir():
+        apps_dir.mkdir(parents=True)
+
+    for old, new in migrations:
+        if old.is_dir() and not new.exists():
+            _LOGGER.info("Migrating %s to %s", old, new)
+            old.rename(new)
+
+    # Opportunistic remove of the now-empty legacy addons directory.
+    # rmdir only succeeds if empty, so leftover files keep it around.
+    legacy_addons = supervisor / "addons"
+    try:
+        legacy_addons.rmdir()
+    except OSError:
+        _LOGGER.debug(
+            "Legacy addons directory '%s' not empty, leaving in place",
+            legacy_addons.as_posix(),
+        )
+
+
+def initialize_system(coresys: CoreSys) -> None:
+    """Set up the default configuration and create folders."""
+    config = coresys.config
+
+    # Home Assistant configuration folder
+    if not config.path_homeassistant.is_dir():
+        _LOGGER.debug(
+            "Creating Home Assistant configuration folder at '%s'",
+            config.path_homeassistant,
+        )
+        config.path_homeassistant.mkdir()
+
+    # Supervisor ssl folder
+    if not config.path_ssl.is_dir():
+        _LOGGER.debug("Creating Supervisor SSL/TLS folder at '%s'", config.path_ssl)
+        config.path_ssl.mkdir()
+
+    # Supervisor app data folder
+    if not config.path_apps_data.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor app data folder at '%s'", config.path_apps_data
+        )
+        config.path_apps_data.mkdir(parents=True)
+
+    if not config.path_apps_local.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor app local repository folder at '%s'",
+            config.path_apps_local,
+        )
+        config.path_apps_local.mkdir(parents=True)
+
+    if not config.path_apps_git.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor app git repositories folder at '%s'",
+            config.path_apps_git,
+        )
+        config.path_apps_git.mkdir(parents=True)
+
+    # Supervisor tmp folder
+    if not config.path_tmp.is_dir():
+        _LOGGER.debug("Creating Supervisor temp folder at '%s'", config.path_tmp)
+        config.path_tmp.mkdir(parents=True)
+
+    # Supervisor backup folder
+    if not config.path_backup.is_dir():
+        _LOGGER.debug("Creating Supervisor backup folder at '%s'", config.path_backup)
+        config.path_backup.mkdir()
+
+    # Core backup folder
+    if not config.path_core_backup.is_dir():
+        _LOGGER.debug("Creating Core backup folder at '%s", config.path_core_backup)
+        config.path_core_backup.mkdir(parents=True)
+
+    # Share folder
+    if not config.path_share.is_dir():
+        _LOGGER.debug("Creating Supervisor share folder at '%s'", config.path_share)
+        config.path_share.mkdir()
+
+    # Apparmor folders
+    if not config.path_apparmor.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor Apparmor Profile folder at '%s'", config.path_apparmor
+        )
+        config.path_apparmor.mkdir()
+
+    if not config.path_apparmor_cache.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor Apparmor Cache folder at '%s'",
+            config.path_apparmor_cache,
+        )
+        config.path_apparmor_cache.mkdir()
+
+    # DNS folder
+    if not config.path_dns.is_dir():
+        _LOGGER.debug("Creating Supervisor DNS folder at '%s'", config.path_dns)
+        config.path_dns.mkdir()
+
+    # Audio folder
+    if not config.path_audio.is_dir():
+        _LOGGER.debug("Creating Supervisor audio folder at '%s'", config.path_audio)
+        config.path_audio.mkdir()
+
+    # Media folder
+    if not config.path_media.is_dir():
+        _LOGGER.debug("Creating Supervisor media folder at '%s'", config.path_media)
+        config.path_media.mkdir()
+
+    # Mounts folders
+    if not config.path_mounts.is_dir():
+        _LOGGER.debug("Creating Supervisor mounts folder at '%s'", config.path_mounts)
+        config.path_mounts.mkdir()
+
+    if not config.path_mounts_credentials.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor mounts credentials folder at '%s'",
+            config.path_mounts_credentials,
+        )
+        config.path_mounts_credentials.mkdir(mode=0o600)
+
+    # Emergency folder
+    if not config.path_emergency.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor emergency folder at '%s'", config.path_emergency
+        )
+        config.path_emergency.mkdir()
+
+    # App Configs folder
+    if not config.path_app_configs.is_dir():
+        _LOGGER.debug(
+            "Creating Supervisor app configs folder at '%s'",
+            config.path_app_configs,
+        )
+        config.path_app_configs.mkdir()
+
+    if not config.path_cid_files.is_dir():
+        _LOGGER.debug("Creating Docker cidfiles folder at '%s'", config.path_cid_files)
+        config.path_cid_files.mkdir()
+
+
+def warning_handler(message, category, filename, lineno, file=None, line=None):
+    """Warning handler which logs warnings using the logging module."""
+    _LOGGER.warning("%s:%s: %s: %s", filename, lineno, category.__name__, message)
+    if isinstance(message, Exception):
+        # Don't capture warnings originating from Sentry SDK threads to
+        # avoid a feedback loop: sending an event can trigger urllib3
+        # warnings which would be captured and sent as new events.
+        if threading.current_thread().name.startswith("sentry-sdk."):
+            return
+        capture_exception(message)
+
+
+def initialize_logging() -> None:
+    """Initialize the logging."""
+    logging.basicConfig(level=logging.INFO)
+    fmt = (
+        "%(asctime)s.%(msecs)03d %(levelname)s (%(threadName)s) [%(name)s] %(message)s"
+    )
+    colorfmt = f"%(log_color)s{fmt}%(reset)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+
+    # suppress overly verbose logs from libraries that aren't helpful
+    logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+
+    logging.getLogger().handlers[0].setFormatter(
+        ColoredFormatter(
+            colorfmt,
+            datefmt=datefmt,
+            reset=True,
+            log_colors={
+                "DEBUG": "cyan",
+                "INFO": "green",
+                "WARNING": "yellow",
+                "ERROR": "red",
+                "CRITICAL": "red",
+            },
+        )
+    )
+    warnings.showwarning = warning_handler
+
+
+def check_environment() -> None:
+    """Check if all environment are exists."""
+    # check environment variables
+    for key in (ENV_SUPERVISOR_SHARE, ENV_SUPERVISOR_NAME):
+        try:
+            os.environ[key]
+        except KeyError:
+            _LOGGER.critical("Can't find '%s' environment variable!", key)
+
+    # Check Machine info
+    if not os.environ.get(ENV_HOMEASSISTANT_REPOSITORY) and not os.environ.get(
+        ENV_SUPERVISOR_MACHINE
+    ):
+        _LOGGER.critical("Can't find any kind of machine/homeassistant details!")
+    elif not os.environ.get(ENV_SUPERVISOR_MACHINE):
+        _LOGGER.info("Use the old homeassistant repository for machine extraction")
+
+    # check docker socket
+    if not SOCKET_DOCKER.is_socket():
+        _LOGGER.critical("Can't find Docker socket!")
+
+
+def register_signal_handlers(
+    loop: asyncio.AbstractEventLoop, shutdown_handler: Callable[[], None]
+) -> None:
+    """Register SIGTERM, SIGHUP and SIGKILL to stop the Supervisor."""
+    try:
+        loop.add_signal_handler(signal.SIGTERM, shutdown_handler)
+    except ValueError, RuntimeError:
+        _LOGGER.warning("Could not bind to SIGTERM")
+
+    try:
+        loop.add_signal_handler(signal.SIGHUP, shutdown_handler)
+    except ValueError, RuntimeError:
+        _LOGGER.warning("Could not bind to SIGHUP")
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, shutdown_handler)
+    except ValueError, RuntimeError:
+        _LOGGER.warning("Could not bind to SIGINT")
+
+
+async def supervisor_debugger(coresys: CoreSys) -> None:
+    """Start debugger if needed."""
+    if not coresys.config.debug:
+        return
+
+    def setup_debugger() -> None:
+        # pylint: disable-next=import-outside-toplevel
+        import debugpy  # noqa: PLC0415
+
+        _LOGGER.info("Initializing Supervisor debugger")
+
+        debugpy.listen(("0.0.0.0", 33333))
+        if coresys.config.debug_block:
+            _LOGGER.info("Wait until debugger is attached")
+            debugpy.wait_for_client()
+
+    await coresys.run_in_executor(setup_debugger)

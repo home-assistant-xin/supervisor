@@ -1,0 +1,542 @@
+"""Main file for Supervisor."""
+
+import asyncio
+from collections.abc import Awaitable
+from contextlib import suppress
+from datetime import timedelta
+import logging
+from typing import Self
+
+from .const import (
+    ATTR_STARTUP,
+    RUN_SUPERVISOR_STATE,
+    STARTING_STATES,
+    AppStartup,
+    BusEvent,
+    CoreState,
+)
+from .coresys import CoreSys, CoreSysAttributes
+from .dbus.const import StopUnitMode, UnitActiveState
+from .exceptions import (
+    AppFileReadError,
+    HassioError,
+    HomeAssistantCrashError,
+    HomeAssistantError,
+    SupervisorUpdateError,
+    WhoamiError,
+    WhoamiSSLError,
+)
+from .homeassistant.core import LANDINGPAGE
+from .resolution.const import ContextType, IssueType, SuggestionType, UnhealthyReason
+from .utils.dt import utcnow
+from .utils.sentry import async_capture_exception
+from .utils.whoami import retrieve_whoami
+
+_LOGGER: logging.Logger = logging.getLogger(__name__)
+
+
+class Core(CoreSysAttributes):
+    """Main object of Supervisor."""
+
+    def __init__(self, coresys: CoreSys) -> None:
+        """Initialize Supervisor object."""
+        self.coresys: CoreSys = coresys
+        self._state: CoreState = CoreState.INITIALIZE
+        self.exit_code: int = 0
+        self._shutdown_event: asyncio.Event = asyncio.Event()
+
+    @property
+    def state(self) -> CoreState:
+        """Return state of the core."""
+        return self._state
+
+    @property
+    def supported(self) -> bool:
+        """Return true if the installation is supported."""
+        return len(self.sys_resolution.unsupported) == 0
+
+    @property
+    def healthy(self) -> bool:
+        """Return true if the installation is healthy."""
+        return len(self.sys_resolution.unhealthy) == 0
+
+    async def _write_run_state(self):
+        """Write run state for s6 service supervisor."""
+        try:
+            await self.sys_run_in_executor(
+                RUN_SUPERVISOR_STATE.write_text, str(self._state), encoding="utf-8"
+            )
+        except OSError as err:
+            _LOGGER.warning(
+                "Can't update the Supervisor state to %s: %s", self._state, err
+            )
+
+    async def post_init(self) -> Self:
+        """Post init actions that must be done in event loop."""
+        await self._write_run_state()
+        return self
+
+    async def set_state(self, new_state: CoreState) -> None:
+        """Set core into new state."""
+        if self._state == new_state:
+            return
+
+        self._state = new_state
+        await self._write_run_state()
+
+        # Don't attempt to notify anyone on CLOSE as we're about to stop the event loop
+        if self._state != CoreState.CLOSE:
+            self.sys_bus.fire_event(BusEvent.SUPERVISOR_STATE_CHANGE, self._state)
+
+            # These will be received by HA after startup has completed which won't make sense
+            if self._state not in STARTING_STATES:
+                self.sys_homeassistant.websocket.supervisor_update_event(
+                    "info", {"state": self._state}
+                )
+
+    async def connect(self) -> None:
+        """Connect Supervisor container."""
+        # Load information from container
+        await self.sys_supervisor.load()
+
+        # Evaluate the system
+        await self.sys_resolution.evaluate.evaluate_system()
+
+        # Check supervisor version/update
+        if self.sys_config.version == self.sys_supervisor.version:
+            return
+
+        # Somethings going wrong
+        _LOGGER.error(
+            "Update '%s' of Supervisor '%s' failed!",
+            self.sys_config.version,
+            self.sys_supervisor.version,
+        )
+
+        if self.sys_supervisor.need_update:
+            self.sys_resolution.create_issue(
+                IssueType.UPDATE_ROLLBACK, ContextType.SUPERVISOR
+            )
+            self.sys_resolution.add_unhealthy_reason(UnhealthyReason.SUPERVISOR)
+
+        # Fix wrong version in config / avoid boot loop on OS
+        self.sys_config.version = self.sys_supervisor.version
+        await self.sys_config.save_data()
+
+    async def setup(self) -> None:
+        """Start setting up supervisor orchestration."""
+        await self.set_state(CoreState.SETUP)
+
+        # Initialize websession early. At this point we'll use the Docker DNS proxy
+        # at 127.0.0.11, which does not have the fallback feature and hence might
+        # fail in certain environments. But a websession is required to get the
+        # initial version information after a device wipe or otherwise empty state
+        # (e.g. CI environment, Supervised).
+        #
+        # An OS installation has the plug-in container images pre-installed, so we
+        # setup can continue even if this early websession fails to connect to the
+        # internet. We'll reinitialize the websession when the DNS plug-in is up to
+        # make sure the DNS plug-in along with its fallback capabilities is used
+        # (see #5857).
+        await self.coresys.init_websession()
+
+        # Check internet on startup
+        await self.sys_supervisor.check_and_update_connectivity(force=True)
+
+        # Order can be important!
+        setup_loads: list[Awaitable[None]] = [
+            # rest api views
+            self.sys_api.load(),
+            # Load Host Hardware
+            self.sys_hardware.load(),
+            # Load DBus
+            self.sys_dbus.load(),
+            # Load Host
+            self.sys_host.load(),
+            # Load HassOS
+            self.sys_os.load(),
+            # Adjust timezone / time settings
+            self._adjust_system_datetime(),
+            # Load mounts
+            self.sys_mounts.load(),
+            # Load Docker manager
+            self.sys_docker.load(),
+            # load last available data
+            self.sys_updater.load(),
+            # Load Plugins container
+            self.sys_plugins.load(),
+            # Load Home Assistant
+            self.sys_homeassistant.load(),
+            # Load CPU/Arch
+            self.sys_arch.load(),
+            # Load Stores
+            self.sys_store.load(),
+            # Load Apps
+            self.sys_apps.load(),
+            # load last available data
+            self.sys_backups.load(),
+            # load services
+            self.sys_services.load(),
+            # Load discovery
+            self.sys_discovery.load(),
+            # Load ingress
+            self.sys_ingress.load(),
+            # Load Resolution
+            self.sys_resolution.load(),
+        ]
+
+        # Execute each load task in secure context
+        for setup_task in setup_loads:
+            try:
+                await setup_task
+            except AppFileReadError as err:
+                # Already reported to the user via the resolution system
+                # (unhealthy reason set by check_oserror). Log without
+                # stack trace and skip Sentry capture to avoid noise.
+                _LOGGER.error(
+                    "Error on load Task %s: %s",
+                    setup_task,
+                    err,
+                )
+                self.sys_resolution.add_unhealthy_reason(UnhealthyReason.SETUP)
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.critical(
+                    "Fatal error happening on load Task %s: %s",
+                    setup_task,
+                    err,
+                    exc_info=True,
+                )
+                self.sys_resolution.add_unhealthy_reason(UnhealthyReason.SETUP)
+                await async_capture_exception(err)
+
+    async def start(self) -> None:
+        """Start Supervisor orchestration."""
+        await self.set_state(CoreState.STARTUP)
+
+        # Set OS Agent diagnostics if needed
+        if (
+            self.sys_dbus.agent.is_connected
+            and self.sys_config.diagnostics is not None
+            and self.sys_dbus.agent.diagnostics != self.sys_config.diagnostics
+            and self.supported
+        ):
+            _LOGGER.debug("Set OS Agent diagnostics to %s", self.sys_config.diagnostics)
+            await self.sys_dbus.agent.set_diagnostics(self.sys_config.diagnostics)
+
+        # Check if system is healthy
+        if not self.supported:
+            _LOGGER.warning("System running in a unsupported environment!")
+        if not self.healthy:
+            _LOGGER.critical(
+                "System is running in an unhealthy state and needs manual intervention!"
+            )
+
+        # Mark booted partition as healthy
+        await self.sys_os.mark_healthy()
+
+        # Refresh update information
+        await self.sys_updater.reload()
+
+        # On release channel, try update itself if auto update enabled
+        if self.sys_supervisor.need_update and self.sys_updater.auto_update:
+            if not self.healthy:
+                _LOGGER.warning("Ignoring Supervisor updates!")
+            else:
+                with suppress(SupervisorUpdateError):
+                    await self.sys_supervisor.update()
+                    return
+
+        try:
+            # Start app mark as initialize
+            await self.sys_apps.boot(AppStartup.INITIALIZE)
+
+            # HomeAssistant is already running, only Supervisor restarted
+            if await self.sys_hardware.helper.last_boot() == self.sys_config.last_boot:
+                _LOGGER.info("Detected Supervisor restart")
+                return
+
+            # reset register services / discovery
+            await self.sys_services.reset()
+
+            # start app mark as system
+            await self.sys_apps.boot(AppStartup.SYSTEM)
+
+            # start app mark as services
+            await self.sys_apps.boot(AppStartup.SERVICES)
+
+            # run HomeAssistant
+            if (
+                self.sys_homeassistant.boot
+                and not await self.sys_homeassistant.core.is_running()
+            ):
+                _LOGGER.info("Start Home Assistant Core")
+                try:
+                    await self.sys_homeassistant.core.start()
+                except HomeAssistantCrashError as err:
+                    _LOGGER.error("Can't start Home Assistant Core - rebuilding")
+                    await async_capture_exception(err)
+
+                    with suppress(HomeAssistantError):
+                        await self.sys_homeassistant.core.rebuild()
+                except HomeAssistantError as err:
+                    await async_capture_exception(err)
+            else:
+                _LOGGER.info("Skipping start of Home Assistant")
+
+            # Core is not running
+            if self.sys_homeassistant.core.error_state:
+                self.sys_resolution.create_issue(
+                    IssueType.FATAL_ERROR,
+                    ContextType.CORE,
+                    suggestions=[SuggestionType.EXECUTE_REPAIR],
+                )
+
+            # start app mark as application
+            await self.sys_apps.boot(AppStartup.APPLICATION)
+
+            # store new last boot
+            await self._update_last_boot()
+
+        finally:
+            # Add core tasks into scheduler
+            await self.sys_tasks.load()
+
+            # If landingpage / run upgrade in background
+            if self.sys_homeassistant.version == LANDINGPAGE:
+                self.sys_create_task(self.sys_homeassistant.core.install())
+
+            # Update Host/Device information
+            self.sys_create_task(self.sys_host.reload())
+            self.sys_create_task(self.sys_resolution.healthcheck())
+
+            await self.set_state(CoreState.RUNNING)
+            self.sys_homeassistant.websocket.supervisor_update_event(
+                "supervisor", {ATTR_STARTUP: "complete"}
+            )
+            _LOGGER.info("Supervisor is up and running")
+
+    async def stop(self, *, stopping_complete: asyncio.Event | None = None) -> None:
+        """Stop a running orchestration.
+
+        stopping_complete is set once the Supervisor is in STOPPING state,
+        in which the system validation middleware rejects new API requests.
+        API handlers that trigger a Supervisor stop (see Supervisor.restart)
+        wait for it before responding, so a request sent after the response
+        gets a clear error instead of being accepted and then killed
+        mid-request when the API server is torn down.
+        """
+        # store new last boot / prevent time adjustments
+        if self.state in (CoreState.RUNNING, CoreState.SHUTDOWN):
+            await self._update_last_boot()
+        if self.state in (CoreState.STOPPING, CoreState.CLOSE):
+            if stopping_complete:
+                stopping_complete.set()
+            return
+
+        # don't process scheduler anymore
+        await self.set_state(CoreState.STOPPING)
+        if stopping_complete:
+            stopping_complete.set()
+
+        # Stage 1
+        try:
+            async with asyncio.timeout(10):
+                await asyncio.wait(
+                    [
+                        self.sys_create_task(coro)
+                        for coro in (
+                            self.sys_api.stop(),
+                            self.sys_scheduler.shutdown(),
+                            self.sys_docker.unload(),
+                        )
+                    ]
+                )
+        except TimeoutError:
+            _LOGGER.warning("Stage 1: Force Shutdown!")
+
+        # Stage 2
+        try:
+            async with asyncio.timeout(10):
+                await asyncio.wait(
+                    [
+                        self.sys_create_task(coro)
+                        for coro in (
+                            self.sys_websession.close(),
+                            self.sys_homeassistant.api.close(),
+                            self.sys_ingress.unload(),
+                            self.sys_hardware.unload(),
+                            self.sys_dbus.unload(),
+                        )
+                    ]
+                )
+        except TimeoutError:
+            _LOGGER.warning("Stage 2: Force Shutdown!")
+
+        await self.set_state(CoreState.CLOSE)
+        _LOGGER.info("Supervisor is down - %d", self.exit_code)
+        self.sys_loop.stop()
+
+    async def teardown_services(
+        self, *, remove_homeassistant_container: bool = False
+    ) -> None:
+        """Stop all apps and Home Assistant Core in correct order.
+
+        Does not change Core state and does not stop plugins. Used during
+        backup restore (state stays FREEZE, plugins keep running) and as
+        the inner step of shutdown().
+        """
+        # Stop application apps (using Home Assistant API)
+        await self.sys_apps.shutdown(AppStartup.APPLICATION)
+
+        # Close Home Assistant Core
+        with suppress(HassioError):
+            await self.sys_homeassistant.core.stop(
+                remove_container=remove_homeassistant_container
+            )
+
+        # Stop system apps
+        await self.sys_apps.shutdown(AppStartup.SERVICES)
+        await self.sys_apps.shutdown(AppStartup.SYSTEM)
+        await self.sys_apps.shutdown(AppStartup.INITIALIZE)
+
+    async def shutdown(self) -> None:
+        """Shut down managed services and plugins.
+
+        Real shutdown ceremony invoked from the SIGTERM signal handler
+        and the host reboot/power-off API. Reentrant: concurrent callers
+        observe state == SHUTDOWN and await the in-flight shutdown rather
+        than re-running the sequence.
+        """
+        # Nothing coherent to shut down before startup completes; the caller
+        # (e.g. signal handler) is expected to follow up with stop().
+        if self.state in STARTING_STATES:
+            _LOGGER.warning(
+                "Ignoring shutdown request, Supervisor has not finished starting"
+            )
+            return
+
+        # Supervisor is already tearing itself down, no point running shutdown
+        if self.state in (CoreState.STOPPING, CoreState.CLOSE):
+            _LOGGER.warning("Ignoring shutdown request, Supervisor is already stopping")
+            return
+
+        # Another shutdown is in progress, wait for it to complete
+        if self.state == CoreState.SHUTDOWN:
+            await self._shutdown_event.wait()
+            return
+
+        try:
+            # Wrap state transition inside try so waiters are released even if
+            # set_state() is cancelled mid-write: Core._state has already been
+            # updated to SHUTDOWN by then (see set_state()), so concurrent
+            # callers would otherwise block on _shutdown_event forever.
+            await self.set_state(CoreState.SHUTDOWN)
+            await self.teardown_services()
+            await self.sys_plugins.shutdown()
+        finally:
+            self._shutdown_event.set()
+
+    async def _update_last_boot(self) -> None:
+        """Update last boot time."""
+        if not (last_boot := await self.sys_hardware.helper.last_boot()):
+            _LOGGER.error("Could not update last boot information!")
+            return
+        self.sys_config.last_boot = last_boot
+        await self.sys_config.save_data()
+
+    async def _adjust_system_datetime(self) -> None:
+        """Adjust system time/date on startup."""
+        # Ensure host system timezone matches supervisor timezone configuration
+        if (
+            self.sys_config.timezone
+            and self.sys_host.info.timezone != self.sys_config.timezone
+            and self.sys_dbus.timedate.is_connected
+        ):
+            _LOGGER.info(
+                "Timezone in Supervisor config '%s' differs from host '%s'",
+                self.sys_config.timezone,
+                self.sys_host.info.timezone,
+            )
+            await self.sys_host.control.set_timezone(self.sys_config.timezone)
+
+        # If no timezone is detect or set
+        # If we are not connected or time sync
+        if (
+            self.sys_config.timezone
+            or self.sys_host.info.timezone not in ("Etc/UTC", None)
+        ) and self.sys_host.info.dt_synchronized:
+            return
+
+        # Get Timezone data
+        try:
+            try:
+                data = await retrieve_whoami(self.sys_websession, True)
+            except WhoamiSSLError:
+                # SSL Date Issue & possible time drift
+                _LOGGER.info("Whoami service SSL error")
+                data = await retrieve_whoami(self.sys_websession, False)
+
+        except WhoamiError as err:
+            _LOGGER.warning("Can't adjust Time/Date settings: %s", err)
+            return
+
+        timezone = self.sys_config.timezone or data.timezone
+        await self.sys_config.set_timezone(timezone)
+        await self.sys_host.control.set_timezone(timezone)
+
+        # Calculate if system time is out of sync
+        delta = abs(data.dt_utc - utcnow())
+        if delta <= timedelta(hours=1) or self.sys_host.info.dt_synchronized:
+            return
+
+        _LOGGER.warning("System time/date shift over more than 1 hour detected!")
+
+        if self.sys_host.info.use_ntp:
+            # Stop timesyncd if NTP is enabled, as set_time is blocked while it runs.
+            # timedated rejects set_time while an NTP unit is active. We listen
+            # for the unit's ActiveState to become inactive before proceeding.
+            _LOGGER.info("Stopping systemd-timesyncd to allow manual time adjustment")
+            timesync_unit = await self.sys_dbus.systemd.get_unit(
+                "systemd-timesyncd.service"
+            )
+            try:
+                async with asyncio.timeout(10):
+                    await self.sys_dbus.systemd.stop_unit(
+                        "systemd-timesyncd.service", StopUnitMode.REPLACE
+                    )
+                    await timesync_unit.wait_for_active_state(
+                        {UnitActiveState.INACTIVE}
+                    )
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Timeout waiting for systemd-timesyncd to stop, "
+                    "attempting time sync anyway"
+                )
+            # Create a repair issue so the user knows NTP was disabled
+            self.sys_resolution.create_issue(
+                IssueType.NTP_SYNC_FAILED,
+                ContextType.SYSTEM,
+                suggestions=[SuggestionType.ENABLE_NTP],
+            )
+
+        await self.sys_host.control.set_datetime(data.dt_utc)
+        # System time was just corrected. TLS certificates that previously
+        # appeared expired/not-yet-valid may now verify, so a connectivity
+        # probe that just failed for that reason can succeed now.
+        await self.sys_supervisor.check_and_update_connectivity(force=True)
+
+    async def repair(self) -> None:
+        """Repair system integrity."""
+        _LOGGER.info("Starting repair of Supervisor Environment")
+        await self.sys_docker.repair()
+
+        # Fix plugins
+        await self.sys_plugins.repair()
+
+        # Restore core functionality
+        await self.sys_apps.repair()
+        await self.sys_homeassistant.core.repair()
+
+        # Tag version for latest
+        await self.sys_supervisor.repair()
+        _LOGGER.info("Finished repair of Supervisor Environment")

@@ -1,0 +1,1512 @@
+"""Core Exceptions."""
+
+from collections.abc import Callable, Mapping
+from typing import Any
+
+from .const import OBSERVER_PORT
+
+
+class HassioError(Exception):
+    """Root exception."""
+
+    error_key: str | None = None
+    message_template: str | None = None
+    extra_fields: dict[str, Any] | None = None
+
+    def __init__(
+        self, message: str | None = None, logger: Callable[..., None] | None = None
+    ) -> None:
+        """Raise & log."""
+        if not message and self.message_template:
+            message = (
+                self.message_template.format(**self.extra_fields)
+                if self.extra_fields
+                else self.message_template
+            )
+
+        if logger is not None and message is not None:
+            logger(message)
+
+        # Init Base
+        if message is not None:
+            super().__init__(message)
+        else:
+            super().__init__()
+
+
+class HassioNotSupportedError(HassioError):
+    """Function is not supported."""
+
+
+# API
+
+
+class APIError(HassioError):
+    """API errors."""
+
+    status = 400
+    headers: Mapping[str, str] | None = None
+
+    def __init__(
+        self,
+        message: str | None = None,
+        logger: Callable[..., None] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+        job_id: str | None = None,
+    ) -> None:
+        """Raise & log, optionally with job."""
+        super().__init__(message, logger)
+        self.headers = headers
+        self.job_id = job_id
+
+
+class APIUnauthorized(APIError):
+    """API unauthorized error."""
+
+    status = 401
+
+
+class APIForbidden(APIError):
+    """API forbidden error."""
+
+    status = 403
+
+
+class APINotFound(APIError):
+    """API not found error."""
+
+    status = 404
+
+
+class APIGone(APIError):
+    """API is no longer available."""
+
+    status = 410
+
+
+class APIConflict(APIError):
+    """API conflict error."""
+
+    status = 409
+
+
+class APITooManyRequests(APIError):
+    """API too many requests error."""
+
+    status = 429
+
+
+class APIInternalServerError(APIError):
+    """API internal server error."""
+
+    status = 500
+
+
+class APIAppNotInstalled(APIError):
+    """Not installed app requested at apps API."""
+
+
+class APIDBMigrationInProgress(APIError):
+    """Service is unavailable due to an offline DB migration is in progress."""
+
+    status = 503
+
+
+class APIUnknownSupervisorError(APIError):
+    """Unknown error occurred within supervisor. Adds supervisor check logs rider to message template."""
+
+    status = 500
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        job_id: str | None = None,
+    ) -> None:
+        """Initialize exception."""
+        self.message_template = (
+            f"{self.message_template}. Check Supervisor logs for details"
+        )
+        super().__init__(None, logger, job_id=job_id)
+
+
+# JobManager
+
+
+class JobException(APIError):
+    """Base job exception.
+
+    Job condition and concurrency failures are considered handled from the
+    Supervisor's point of view and reported to the caller as client-side
+    errors. Inheriting APIError lets api_process surface them with their
+    explicit message (see #6739) instead of treating them as unexpected.
+    """
+
+
+class JobConditionException(JobException):
+    """Exception happening for job conditions."""
+
+
+class JobStartException(JobException):
+    """Exception occurred starting a job on in current asyncio task."""
+
+
+class JobNotFound(JobException):
+    """Exception for job not found."""
+
+
+class JobInvalidUpdate(JobException):
+    """Exception for invalid update to a job."""
+
+
+class JobGroupExecutionLimitExceeded(JobException):
+    """Exception when job group execution limit exceeded."""
+
+
+# HomeAssistant
+
+
+class HomeAssistantError(HassioError):
+    """Home Assistant exception."""
+
+
+class HomeAssistantUpdateError(HomeAssistantError, APIError):
+    """Error on update of a Home Assistant."""
+
+    error_key = "homeassistant_update_error"
+    message_template = "Updating Home Assistant failed"
+
+
+class HomeAssistantUpdateImageError(HomeAssistantUpdateError):
+    """Raise when the Home Assistant image cannot be downloaded during update."""
+
+    error_key = "homeassistant_update_image_error"
+    message_template = "Downloading Home Assistant version {version} failed"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, version: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"version": version}
+        super().__init__(None, logger)
+
+
+class HomeAssistantUpdateAlreadyInstalledError(HomeAssistantUpdateError):
+    """Raise when the requested Home Assistant version is already installed."""
+
+    error_key = "homeassistant_update_already_installed_error"
+    message_template = "Home Assistant version {version} is already installed"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, version: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"version": version}
+        super().__init__(None, logger)
+
+
+class HomeAssistantCrashError(HomeAssistantError):
+    """Error on crash of a Home Assistant startup."""
+
+
+class HomeAssistantStartupTimeout(HomeAssistantCrashError):
+    """Timeout waiting for Home Assistant successful startup."""
+
+
+class HomeAssistantAPIError(HomeAssistantError):
+    """Home Assistant API exception."""
+
+
+class HomeAssistantAuthError(HomeAssistantAPIError):
+    """Home Assistant Auth API exception."""
+
+
+class HomeAssistantWSError(HomeAssistantAPIError):
+    """Home Assistant websocket error."""
+
+
+class HomeAssistantWSConnectionError(HomeAssistantWSError):
+    """Raise when the WebSocket connection has an error."""
+
+
+class HomeAssistantJobError(HomeAssistantError, JobException):
+    """Raise on Home Assistant job error."""
+
+
+# Supervisor
+
+
+class SupervisorError(HassioError):
+    """Supervisor error."""
+
+
+class SupervisorUpdateError(SupervisorError):
+    """Supervisor update error."""
+
+
+class SupervisorAppArmorError(SupervisorError):
+    """Supervisor AppArmor error."""
+
+
+class SupervisorUnknownError(SupervisorError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs interacting with Supervisor or its container."""
+
+    error_key = "supervisor_unknown_error"
+    message_template = "An unknown error occurred with Supervisor"
+
+
+class SupervisorJobError(SupervisorError, JobException):
+    """Raise on job errors."""
+
+
+# HassOS
+
+
+class HassOSError(HassioError):
+    """HassOS exception."""
+
+
+class HassOSUpdateError(HassOSError):
+    """Error on update of a HassOS."""
+
+
+class HassOSJobError(HassOSError, JobException):
+    """Function not supported by HassOS."""
+
+
+class HassOSDataDiskError(HassOSError):
+    """Issues with the DataDisk feature from HAOS."""
+
+
+class HassOSSlotNotFound(HassOSError):
+    """Could not find boot slot."""
+
+
+class HassOSSlotUpdateError(HassOSError):
+    """Error while updating a slot via rauc."""
+
+
+# All Plugins
+
+
+class PluginError(HassioError):
+    """Plugin error."""
+
+
+class PluginJobError(PluginError, JobException):
+    """Raise on job error with plugin."""
+
+
+# HaCli
+
+
+class CliError(PluginError):
+    """HA cli exception."""
+
+
+class CliUpdateError(CliError):
+    """Error on update of a HA cli."""
+
+
+class CliJobError(CliError, PluginJobError):
+    """Raise on job error with cli plugin."""
+
+
+# Observer
+
+
+class ObserverError(PluginError):
+    """General Observer exception."""
+
+
+class ObserverUpdateError(ObserverError):
+    """Error on update of a Observer."""
+
+
+class ObserverJobError(ObserverError, PluginJobError):
+    """Raise on job error with observer plugin."""
+
+
+class ObserverPortConflict(ObserverError, APIError):
+    """Raise if observer cannot start due to a port conflict."""
+
+    error_key = "observer_port_conflict"
+    message_template = "Cannot start {observer} because port {port} is already in use"
+    extra_fields = {"observer": "observer", "port": OBSERVER_PORT}
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger)
+
+
+# Multicast
+
+
+class MulticastError(PluginError):
+    """Multicast exception."""
+
+
+class MulticastUpdateError(MulticastError):
+    """Error on update of a multicast."""
+
+
+class MulticastJobError(MulticastError, PluginJobError):
+    """Raise on job error with multicast plugin."""
+
+
+# DNS
+
+
+class CoreDNSError(PluginError):
+    """CoreDNS exception."""
+
+
+class CoreDNSUpdateError(CoreDNSError):
+    """Error on update of a CoreDNS."""
+
+
+class CoreDNSJobError(CoreDNSError, PluginJobError):
+    """Raise on job error with dns plugin."""
+
+
+# Audio
+
+
+class AudioError(PluginError):
+    """PulseAudio exception."""
+
+
+class AudioUpdateError(AudioError):
+    """Error on update of a Audio."""
+
+
+class AudioJobError(AudioError, PluginJobError):
+    """Raise on job error with audio plugin."""
+
+
+# Apps
+
+
+class AppsError(HassioError):
+    """Apps exception."""
+
+
+class AppAPIError(AppsError, APIError):
+    """Base class for App-related API errors that have an app for context.
+
+    Owns the shape of extra_fields so subclasses uniformly expose app
+    (display name) and slug. Pass an app-like object (anything with .name
+    and .slug attributes — App, AppModel, AppStore). Errors raised without
+    an app object available (e.g., unknown or not-installed app lookups)
+    do not belong here; they inherit (AppsError, APIError) directly.
+    """
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: Any,
+        **extra_fields: Any,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {
+            "app": app.name,
+            "slug": app.slug,
+            **extra_fields,
+        }
+        super().__init__(None, logger)
+
+
+class AppAlreadyInstalledError(AppAPIError):
+    """Raise when attempting to install an app that is already installed."""
+
+    error_key = "app_already_installed_error"
+    message_template = "App {app} is already installed"
+
+
+class AppNotFoundError(AppsError, APIError):
+    """Raise when an app cannot be found in any store.
+
+    No app object exists at this point, so this is not an AppAPIError.
+    """
+
+    error_key = "app_not_found_error"
+    message_template = "App {slug} does not exist"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, slug: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"slug": slug}
+        super().__init__(None, logger)
+
+
+class AppNotInstalledError(AppsError, APIError):
+    """Raise when an action is taken on an app that is not installed.
+
+    No app object exists at this point, so this is not an AppAPIError.
+    """
+
+    error_key = "app_not_installed_error"
+    message_template = "App {slug} is not installed"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, slug: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"slug": slug}
+        super().__init__(None, logger)
+
+
+class AppNotInStoreError(AppAPIError):
+    """Raise when an installed app is no longer available in its store."""
+
+    error_key = "app_not_in_store_error"
+    message_template = "App {app} is not available inside store"
+
+
+class AppNoUpdateAvailableError(AppAPIError):
+    """Raise when an update is requested but local matches store version."""
+
+    error_key = "app_no_update_available_error"
+    message_template = "No update available for app {app}"
+
+
+class AppRebuildVersionChangedError(AppAPIError):
+    """Raise when rebuild is requested but local and store versions differ."""
+
+    error_key = "app_rebuild_version_changed_error"
+    message_template = (
+        "Local and store versions of app {app} differ, use Update instead of Rebuild"
+    )
+
+
+class AppConfigurationError(AppsError):
+    """Error with app configuration."""
+
+
+class AppConfigurationInvalidError(AppConfigurationError, APIError):
+    """Raise if invalid configuration provided for app."""
+
+    error_key = "app_configuration_invalid_error"
+    message_template = "App {app} has invalid options: {validation_error}"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: str,
+        validation_error: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app, "validation_error": validation_error}
+        super().__init__(None, logger)
+
+
+class AppBootConfigCannotChangeError(AppsError, APIError):
+    """Raise if user attempts to change app boot config when it can't be changed."""
+
+    error_key = "app_boot_config_cannot_change_error"
+    message_template = (
+        "App {app} boot option is set to {boot_config} so it cannot be changed"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, app: str, boot_config: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app, "boot_config": boot_config}
+        super().__init__(None, logger)
+
+
+class AppNotRunningError(AppsError, APIError):
+    """Raise when an app is not running."""
+
+    error_key = "app_not_running_error"
+    message_template = "App {app} is not running"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, app: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app}
+        super().__init__(None, logger)
+
+
+class AppPortConflict(AppsError, APIError):
+    """Raise if app cannot start due to a port conflict."""
+
+    error_key = "app_port_conflict"
+    message_template = "Cannot start app {name} because port {port} is already in use"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, name: str, port: int
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"name": name, "port": port}
+        super().__init__(None, logger)
+
+
+class AppNotSupportedError(HassioNotSupportedError):
+    """App doesn't support a function."""
+
+
+class AppNotSupportedArchitectureError(AppNotSupportedError, AppAPIError):
+    """App does not support system due to architecture."""
+
+    error_key = "app_not_supported_architecture_error"
+    message_template = "App {app} not supported on this platform, supported architectures: {architectures}"
+
+    def __init__(  # pylint: disable=useless-parent-delegation
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: Any,
+        architectures: list[str],
+    ) -> None:
+        """Initialize exception."""
+        super().__init__(logger, app=app, architectures=", ".join(architectures))
+
+
+class AppNotSupportedMachineTypeError(AppNotSupportedError, AppAPIError):
+    """App does not support system due to machine type."""
+
+    error_key = "app_not_supported_machine_type_error"
+    message_template = "App {app} not supported on this machine, supported machine types: {machine_types}"
+
+    def __init__(  # pylint: disable=useless-parent-delegation
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: Any,
+        machine_types: list[str],
+    ) -> None:
+        """Initialize exception."""
+        super().__init__(logger, app=app, machine_types=", ".join(machine_types))
+
+
+class AppNotSupportedHomeAssistantVersionError(AppNotSupportedError, AppAPIError):
+    """App does not support system due to Home Assistant version."""
+
+    error_key = "app_not_supported_home_assistant_version_error"
+    message_template = "App {app} not supported on this system, requires Home Assistant version {version} or greater"
+
+    def __init__(  # pylint: disable=useless-parent-delegation
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: Any,
+        version: str,
+    ) -> None:
+        """Initialize exception."""
+        super().__init__(logger, app=app, version=version)
+
+
+class AppRebuildImageBasedError(AppNotSupportedError, AppAPIError):
+    """Raise when rebuild is requested for an image-based app."""
+
+    error_key = "app_rebuild_image_based_error"
+    message_template = "Cannot rebuild app {app}, it is image-based"
+
+
+class AppNotSupportedWriteStdinError(AppNotSupportedError, APIError):
+    """App does not support writing to stdin."""
+
+    error_key = "app_not_supported_write_stdin_error"
+    message_template = "App {app} does not support writing to stdin"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, app: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app}
+        super().__init__(None, logger)
+
+
+class AppBuildDockerfileMissingError(AppNotSupportedError, APIError):
+    """Raise when app build invalid because dockerfile is missing."""
+
+    error_key = "app_build_dockerfile_missing_error"
+    message_template = (
+        "Cannot build app '{app}' because dockerfile is missing. A repair "
+        "using '{repair_command}' will fix this if the cause is data "
+        "corruption. Otherwise please report this to the app developer."
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, app: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app, "repair_command": "ha supervisor repair"}
+        super().__init__(None, logger)
+
+
+class AppBuildArchitectureNotSupportedError(AppNotSupportedError, APIError):
+    """Raise when app cannot be built on system because it doesn't support its architecture."""
+
+    error_key = "app_build_architecture_not_supported_error"
+    message_template = (
+        "Cannot build app '{app}' because its supported architectures "
+        "({app_arches}) do not match the system supported architectures ({system_arches})"
+    )
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: str,
+        app_arch_list: list[str],
+        system_arch_list: list[str],
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {
+            "app": app,
+            "app_arches": ", ".join(app_arch_list),
+            "system_arches": ", ".join(system_arch_list),
+        }
+        super().__init__(None, logger)
+
+
+class AppUnknownError(AppsError, APIUnknownSupervisorError):
+    """Raise when unknown error occurs taking an action for an app."""
+
+    error_key = "app_unknown_error"
+    message_template = "An unknown error occurred with app {app}"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, app: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app}
+        super().__init__(logger)
+
+
+class AppBuildFailedUnknownError(AppsError, APIUnknownSupervisorError):
+    """Raise when the build failed for an app due to an unknown error."""
+
+    error_key = "app_build_failed_unknown_error"
+    message_template = (
+        "An unknown error occurred while trying to build the image for app {app}"
+    )
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, app: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app}
+        super().__init__(logger)
+
+
+class AppFileReadError(AppsError, APIError):
+    """Raise when an app metadata file cannot be read due to a filesystem error."""
+
+    error_key = "app_file_read_error"
+    message_template = (
+        "Could not read metadata for app {app} due to a filesystem error: {error}"
+    )
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: str,
+        error: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app, "error": error}
+        super().__init__(None, logger)
+
+
+class AppsJobError(AppsError, JobException):
+    """Raise on job errors."""
+
+
+# Arch
+
+
+class HassioArchNotFound(HassioNotSupportedError):
+    """No matches with exists arch."""
+
+
+# Updater
+
+
+class UpdaterError(HassioError):
+    """Error on Updater."""
+
+
+class UpdaterJobError(UpdaterError, JobException):
+    """Raise on job error."""
+
+
+# Auth
+
+
+class AuthError(HassioError):
+    """Auth errors."""
+
+
+class AuthPasswordResetError(AuthError, APIError):
+    """Auth error if password reset failed."""
+
+    error_key = "auth_password_reset_error"
+    message_template = "Username '{user}' does not exist. Check list of users using '{auth_list_command}'."
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        user: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"user": user, "auth_list_command": "ha auth list"}
+        super().__init__(None, logger)
+
+
+class AuthListUsersError(AuthError, APIUnknownSupervisorError):
+    """Auth error if listing users failed."""
+
+    error_key = "auth_list_users_error"
+    message_template = "Can't request listing users on Home Assistant"
+
+
+class AuthInvalidNonStringValueError(AuthError, APIUnauthorized):
+    """Auth error if something besides a string provided as username or password."""
+
+    error_key = "auth_invalid_non_string_value_error"
+    message_template = "Username and password must be strings"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        """Initialize exception."""
+        super().__init__(None, logger, headers=headers)
+
+
+class AuthHomeAssistantAPIValidationError(AuthError, APIUnknownSupervisorError):
+    """Error encountered trying to validate auth details via Home Assistant API."""
+
+    error_key = "auth_home_assistant_api_validation_error"
+    message_template = "Unable to validate authentication details with Home Assistant"
+
+
+# Host
+
+
+class HostError(HassioError):
+    """Internal Host error."""
+
+
+class HostNotSupportedError(HassioNotSupportedError):
+    """Host function is not supported."""
+
+
+class HostServiceError(HostError):
+    """Host service functions failed."""
+
+
+class HostAppArmorError(HostError):
+    """Host apparmor functions failed."""
+
+
+class HostNetworkError(HostError):
+    """Error with host network."""
+
+
+class HostNetworkNotFound(HostError):
+    """Return if host interface is not found."""
+
+
+class HostLogError(HostError):
+    """Internal error with host log."""
+
+
+class HostContainerLogEpochError(APIUnknownSupervisorError, HostLogError):
+    """Failed to determine container log epoch via journald."""
+
+    error_key = "host_container_log_epoch_error"
+    message_template = "Cannot determine {symbol} of {identifiers}"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        identifiers: list[str],
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {
+            "symbol": "CONTAINER_LOG_EPOCH",
+            "identifiers": ", ".join(identifiers),
+        }
+        super().__init__(logger)
+
+
+class HostInvalidHostnameError(HostError, APIError):
+    """Hostname rejected by the host as semantically invalid."""
+
+    error_key = "host_invalid_hostname"
+    message_template = "Invalid hostname '{hostname}'"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        hostname: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"hostname": hostname}
+        super().__init__(None, logger)
+
+
+# Service / Discovery
+
+
+class DiscoveryError(HassioError):
+    """Discovery Errors."""
+
+
+class ServicesError(HassioError):
+    """Services Errors."""
+
+
+class ServiceAlreadyProvidedError(ServicesError, APIConflict):
+    """Raise when a service is already provided by another app."""
+
+    error_key = "service_already_provided_error"
+    message_template = "The {service} service is already provided by {app}"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        service: str,
+        app: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"service": service, "app": app}
+        super().__init__(None, logger)
+
+
+class ServiceNotProvidedError(ServicesError, APINotFound):
+    """Raise when a service is not currently provided by any app."""
+
+    error_key = "service_not_provided_error"
+    message_template = "The {service} service is not currently provided by any app"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        service: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"service": service}
+        super().__init__(None, logger)
+
+
+# utils/dbus
+
+
+class DBusError(HassioError):
+    """D-Bus generic error."""
+
+
+class DBusNotConnectedError(HostNotSupportedError):
+    """D-Bus is not connected and call a method."""
+
+
+class DBusServiceUnkownError(HassioNotSupportedError):
+    """D-Bus service was not available."""
+
+
+class DBusInterfaceError(HassioNotSupportedError):
+    """D-Bus interface not connected."""
+
+
+class DBusObjectError(HassioNotSupportedError):
+    """D-Bus object not defined."""
+
+
+class DBusInterfaceMethodError(DBusInterfaceError):
+    """D-Bus method not defined or input does not match signature."""
+
+
+class DBusInterfacePropertyError(DBusInterfaceError):
+    """D-Bus property not defined or is read-only."""
+
+
+class DBusInterfaceSignalError(DBusInterfaceError):
+    """D-Bus signal not defined."""
+
+
+class DBusInvalidArgsError(DBusError):
+    """D-Bus argument value rejected by the service.
+
+    Distinct from DBusInterfaceMethodError: the method exists and the
+    argument types match the signature, but the service rejected an
+    argument's value as semantically invalid.
+    """
+
+
+class DBusParseError(DBusError):
+    """D-Bus parse error."""
+
+
+class DBusTimeoutError(DBusError):
+    """D-Bus call timeout."""
+
+
+class DBusTimedOutError(DBusError):
+    """D-Bus call timed out (typically when systemd D-Bus service activation fail)."""
+
+
+class DBusNoReplyError(DBusError):
+    """D-Bus remote didn't reply/disconnected."""
+
+
+class DBusFatalError(DBusError):
+    """D-Bus call going wrong.
+
+    Type field contains specific error from D-Bus for interface specific errors (like Systemd ones).
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        logger: Callable[..., None] | None = None,
+        type_: str | None = None,
+    ) -> None:
+        """Initialize object."""
+        super().__init__(message, logger)
+        self.type = type_
+
+
+# dbus/systemd
+
+
+class DBusSystemdNoSuchUnit(DBusError):
+    """Systemd unit does not exist."""
+
+
+# util/apparmor
+
+
+class AppArmorError(HostAppArmorError):
+    """General AppArmor error."""
+
+
+class AppArmorFileError(AppArmorError):
+    """AppArmor profile file error."""
+
+
+class AppArmorInvalidError(AppArmorError):
+    """AppArmor profile validate error."""
+
+
+# util/boards
+
+
+class BoardInvalidError(DBusObjectError):
+    """System does not use the board specified."""
+
+
+# util/common
+
+
+class ConfigurationFileError(HassioError):
+    """Invalid JSON or YAML file."""
+
+
+# util/json
+
+
+class JsonFileError(ConfigurationFileError):
+    """Invalid JSON file."""
+
+
+# util/yaml
+
+
+class YamlFileError(ConfigurationFileError):
+    """Invalid YAML file."""
+
+
+# util/pwned
+
+
+class PwnedError(HassioError):
+    """Errors while checking pwned passwords."""
+
+
+class PwnedSecret(PwnedError):
+    """Pwned secrets found."""
+
+
+class PwnedConnectivityError(PwnedError):
+    """Connectivity errors while checking pwned passwords."""
+
+
+# util/whoami
+
+
+class WhoamiError(HassioError):
+    """Error while using whoami."""
+
+
+class WhoamiSSLError(WhoamiError):
+    """Error with the SSL certificate."""
+
+
+class WhoamiConnectivityError(WhoamiError):
+    """Connectivity errors while using whoami."""
+
+
+# utils/systemd_journal
+
+
+class SystemdJournalError(HassioError):
+    """Error while processing systemd journal logs."""
+
+
+class MalformedBinaryEntryError(SystemdJournalError):
+    """Raised when binary entry in the journal isn't followed by a newline."""
+
+
+# docker/api
+
+
+class DockerError(HassioError):
+    """Docker API/Transport errors."""
+
+
+class DockerTimeoutError(DockerError):
+    """Docker operation timed out."""
+
+
+class DockerBuildError(DockerError):
+    """Docker error during build."""
+
+
+class DockerAPIError(DockerError):
+    """Docker API error."""
+
+
+class DockerTrustError(DockerError):
+    """Raise if images are not trusted."""
+
+
+class DockerNotFound(DockerError):
+    """Docker object don't Exists."""
+
+
+class DockerNoSpaceOnDevice(DockerError):
+    """Raise if a docker pull fails due to available space."""
+
+    error_key = "docker_no_space_on_device"
+    message_template = "No space left on disk"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger=logger)
+
+
+class DockerContainerPortConflict(DockerError, APIError):
+    """Raise if docker cannot start a container due to a port conflict."""
+
+    error_key = "docker_container_port_conflict"
+    message_template = (
+        "Cannot start container {name} because port {port} is already in use"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, name: str, port: int
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"name": name, "port": port}
+        super().__init__(None, logger)
+
+
+class DockerRegistryAuthError(DockerError, APIError):
+    """Raise when Docker registry authentication fails."""
+
+    error_key = "docker_registry_auth_error"
+    message_template = (
+        "Docker registry authentication failed for {registry}. "
+        "Check your registry credentials"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, registry: str
+    ) -> None:
+        """Raise & log."""
+        self.extra_fields = {"registry": registry}
+        super().__init__(None, logger=logger)
+
+
+class DockerRegistryRateLimitExceeded(DockerError, APITooManyRequests):
+    """Raise when a container registry rate limits requests."""
+
+    error_key = "container_registry_rate_limit_exceeded"
+    message_template = "Container registry rate limit exceeded"
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Raise & log."""
+        super().__init__(None, logger=logger)
+
+
+class DockerHubRateLimitExceeded(DockerRegistryRateLimitExceeded):
+    """Raise for Docker Hub rate limit exceeded error."""
+
+    error_key = "dockerhub_rate_limit_exceeded"
+    message_template = (
+        "Your IP address has made too many requests to Docker Hub which activated a rate limit. "
+        "For more details see {dockerhub_rate_limit_url}"
+    )
+    extra_fields = {
+        "dockerhub_rate_limit_url": "https://www.home-assistant.io/more-info/dockerhub-rate-limit"
+    }
+
+
+class GithubContainerRegistryRateLimitExceeded(DockerRegistryRateLimitExceeded):
+    """Raise for GitHub Container Registry rate limit exceeded error."""
+
+    error_key = "ghcr_rate_limit_exceeded"
+    message_template = (
+        "GitHub Container Registry rate limited the request. "
+        "This is typically transient; the update will be retried."
+    )
+
+
+class DockerJobError(DockerError, JobException):
+    """Error executing docker job."""
+
+
+# Hardware
+
+
+class HardwareError(HassioError):
+    """General Hardware Error on Supervisor."""
+
+
+class HardwareNotFound(HardwareError):
+    """Hardware path or device doesn't exist on the Host."""
+
+
+class HardwareNotSupportedError(HassioNotSupportedError):
+    """Raise if hardware function is not supported."""
+
+
+# Pulse Audio
+
+
+class PulseAudioError(HassioError):
+    """Raise if an sound error is happening."""
+
+
+# Resolution
+
+
+class ResolutionError(HassioError):
+    """Raise if an error is happening on resolution."""
+
+
+class ResolutionCheckError(ResolutionError):
+    """Raise when there are an issue managing checks."""
+
+
+class ResolutionNotFound(ResolutionError):
+    """Raise if suggestion/issue was not found."""
+
+
+class ResolutionFixupError(HassioError):
+    """Raise if a fixup fails."""
+
+
+class ResolutionFixupJobError(ResolutionFixupError, JobException):
+    """Raise on job error."""
+
+
+class ResolutionCheckNotFound(ResolutionNotFound, APINotFound):
+    """Raise if check does not exist."""
+
+    error_key = "resolution_check_not_found_error"
+    message_template = "Check '{check}' does not exist"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, check: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"check": check}
+        super().__init__(None, logger)
+
+
+class ResolutionIssueNotFound(ResolutionNotFound, APINotFound):
+    """Raise if issue does not exist."""
+
+    error_key = "resolution_issue_not_found_error"
+    message_template = "Issue {uuid} does not exist"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, uuid: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"uuid": uuid}
+        super().__init__(None, logger)
+
+
+class ResolutionSuggestionNotFound(ResolutionNotFound, APINotFound):
+    """Raise if suggestion does not exist."""
+
+    error_key = "resolution_suggestion_not_found_error"
+    message_template = "Suggestion {uuid} does not exist"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, uuid: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"uuid": uuid}
+        super().__init__(None, logger)
+
+
+# Store
+
+
+class StoreError(HassioError):
+    """Raise if an error on store is happening."""
+
+
+class StoreGitError(StoreError):
+    """Raise if something on git is happening."""
+
+
+class StoreGitCloneError(StoreGitError):
+    """Raise if error occurred while cloning repository."""
+
+
+class StoreNotFound(StoreError):
+    """Raise if slug is not known."""
+
+
+class StoreAppNotFoundError(StoreError, APINotFound):
+    """Raise if a requested app is not in the store."""
+
+    error_key = "store_app_not_found_error"
+    message_template = "App {app} does not exist in the store"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, app: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app}
+        super().__init__(None, logger)
+
+
+class StoreRepositoryAlreadyAddedError(StoreError, APIConflict):
+    """Raise when a repository is already added to the store."""
+
+    error_key = "store_repository_already_added_error"
+    message_template = "Can't add {url}, already in the store"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, url: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"url": url}
+        super().__init__(None, logger)
+
+
+class StoreRepositoryLocalCannotReset(StoreError, APIError):
+    """Raise if user requests a reset on the local app repository."""
+
+    error_key = "store_repository_local_cannot_reset"
+    message_template = "Can't reset repository {local_repo} as it is not git based!"
+    extra_fields = {"local_repo": "local"}
+
+    def __init__(self, logger: Callable[..., None] | None = None) -> None:
+        """Initialize exception."""
+        super().__init__(None, logger)
+
+
+class StoreJobError(StoreError, JobException):
+    """Raise on job error with git."""
+
+
+class StoreInvalidAppRepo(StoreError):
+    """Raise on invalid app repo."""
+
+
+class StoreRepositoryUnknownError(StoreError, APIUnknownSupervisorError):
+    """Raise when unknown error occurs taking an action for a store repository."""
+
+    error_key = "store_repository_unknown_error"
+    message_template = "An unknown error occurred with app repository {repo}"
+
+    def __init__(self, logger: Callable[..., None] | None = None, *, repo: str) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"repo": repo}
+        super().__init__(logger)
+
+
+# Backup
+
+
+class BackupError(HassioError):
+    """Raise if an error during backup is happening."""
+
+
+class HomeAssistantBackupError(BackupError, HomeAssistantError):
+    """Raise if an error during Home Assistant Core backup is happening."""
+
+
+class BackupInvalidError(BackupError):
+    """Raise if backup or password provided is invalid."""
+
+
+class BackupMountDownError(BackupError, APIError):
+    """Raise if mount specified for backup is down."""
+
+    error_key = "backup_mount_down"
+    message_template = "Backup mount '{mount}' is down"
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        mount: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"mount": mount}
+        super().__init__(None, logger)
+
+
+class BackupDataDiskBadMessageError(BackupError):
+    """Raise if bad message error received from data disk during backup."""
+
+
+class BackupJobError(BackupError, JobException):
+    """Raise on Backup job error."""
+
+
+class BackupFileNotFoundError(BackupError, APINotFound):
+    """Raise if the backup file hasn't been found."""
+
+
+class BackupPermissionError(BackupError):
+    """Raise if we could not write the backup due to permission error."""
+
+
+class BackupFileExistError(BackupError):
+    """Raise if the backup file already exists."""
+
+
+class BackupFatalIOError(BackupError):
+    """Raise on write-side I/O errors that leave the backup tar corrupt."""
+
+
+class AppBackupMetadataInvalidError(BackupError, APIError):
+    """Raise if invalid metadata file provided for app in backup."""
+
+    error_key = "app_backup_metadata_invalid_error"
+    message_template = (
+        "Metadata file for app {app} in backup is invalid: {validation_error}"
+    )
+
+    def __init__(
+        self,
+        logger: Callable[..., None] | None = None,
+        *,
+        app: str,
+        validation_error: str,
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"app": app, "validation_error": validation_error}
+        super().__init__(None, logger)
+
+
+class AppPrePostBackupCommandReturnedError(BackupError, APIError):
+    """Raise when app's pre/post backup command returns an error."""
+
+    error_key = "app_pre_post_backup_command_returned_error"
+    message_template = (
+        "Pre-/Post backup command for app {app} returned error code: "
+        "{exit_code}. Please report this to the app developer. Enable debug "
+        "logging to capture complete command output using {debug_logging_command}"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, app: str, exit_code: int
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {
+            "app": app,
+            "exit_code": exit_code,
+            "debug_logging_command": "ha supervisor options --logging debug",
+        }
+        super().__init__(None, logger)
+
+
+class BackupRestoreUnknownError(BackupError, APIUnknownSupervisorError):
+    """Raise when an unknown error occurs during backup or restore."""
+
+    error_key = "backup_restore_unknown_error"
+    message_template = "An unknown error occurred during backup/restore"
+
+
+# Security
+
+
+class SecurityError(HassioError):
+    """Raise if an error during security checks are happening."""
+
+
+class SecurityJobError(SecurityError, JobException):
+    """Raise on Security job error."""
+
+
+# Mount
+
+
+class MountError(APIError):
+    """Raise on an error related to mounting/unmounting.
+
+    Mount failures generally reflect user configuration or host conditions
+    (unreachable server, wrong credentials, ...) rather than a Supervisor bug.
+    Modeling them as APIError keeps them out of the unexpected-error path that
+    logs a traceback and reports to Sentry.
+    """
+
+
+class MountActivationError(MountError):
+    """Raise on mount not reaching active state after mount/reload."""
+
+
+class MountInvalidError(MountError):
+    """Raise on invalid mount attempt."""
+
+
+class MountTargetNotDirectoryError(MountInvalidError):
+    """Raise when a mount target exists but is not a directory."""
+
+    error_key = "mount_target_not_directory_error"
+    message_template = "Cannot mount {name} at {path} as it is not a directory"
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, name: str, path: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name, "path": path}
+        super().__init__(None, logger)
+
+
+class MountTargetNotEmptyError(MountInvalidError):
+    """Raise when a mount target directory contains existing data."""
+
+    error_key = "mount_target_not_empty_error"
+    message_template = (
+        "Cannot mount {name} because there is existing data at {path}. "
+        "Move it away first, then retry"
+    )
+
+    def __init__(
+        self, logger: Callable[..., None] | None = None, *, name: str, path: str
+    ) -> None:
+        """Initialize exception."""
+        self.extra_fields = {"name": name, "path": path}
+        super().__init__(None, logger)
+
+
+class MountNotFound(MountError, APINotFound):
+    """Raise on mount not found."""
+
+
+class MountJobError(MountError, JobException):
+    """Raise on Mount job error."""
+
+
+# Network
+
+
+class NetworkInterfaceNotFound(HassioError):
+    """Raise on network interface not found."""

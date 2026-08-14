@@ -1,0 +1,12 @@
+"""Discovery static data."""
+
+ATTR_API_KEY = "api_key"
+ATTR_HOST = "host"
+ATTR_PASSWORD = "password"
+ATTR_PORT = "port"
+ATTR_PROTOCOL = "protocol"
+ATTR_SERIAL = "serial"
+ATTR_SSL = "ssl"
+ATTR_URI = "uri"
+ATTR_URL = "url"
+ATTR_USERNAME = "username"

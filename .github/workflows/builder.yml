@@ -120,12 +120,7 @@ jobs:
       # Chinese source replacements
       - name: Set source
         run: |
-          sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
-          sed -i ${{ vars.ADDONS_SOURCE }} supervisor/store/const.py
-          sed -i ${{ vars.GHCR_DOWNLOAD_SOURCE }} supervisor/docker/interface.py
-          sed -i ${{ vars.OS_DOWNLOAD_SOURCE }} supervisor/os/manager.py
-          sed -i ${{ vars.REPLACE_REPOSITORY_NAME }} pyproject.toml
-          sed -i ${{ vars.MODIFY_TIMEZONE }} Dockerfile
+          python3 .github/scripts/patch_china_acceleration.py
 
       - name: Write env-file for wheels build
         if: needs.init.outputs.build_wheels == 'true'
@@ -271,12 +266,7 @@ jobs:
       # Chinese source replacements
       - name: Set source
         run: |
-          sed -i ${{ vars.VERSION_SOURCE }} supervisor/const.py
-          sed -i ${{ vars.ADDONS_SOURCE }} supervisor/store/const.py
-          sed -i ${{ vars.GHCR_DOWNLOAD_SOURCE }} supervisor/docker/interface.py
-          sed -i ${{ vars.OS_DOWNLOAD_SOURCE }} supervisor/os/manager.py
-          sed -i ${{ vars.REPLACE_REPOSITORY_NAME }} pyproject.toml
-          sed -i ${{ vars.MODIFY_TIMEZONE }} Dockerfile
+          python3 .github/scripts/patch_china_acceleration.py
 
       # Build the Supervisor for non-publish runs (e.g. PRs)
       - name: Build the Supervisor

@@ -258,7 +258,7 @@ class App(AppModel):
             self.sys_resolution.dismiss_issue(access_issue)
 
         self.sys_homeassistant.websocket.supervisor_event_custom(
-            WSEvent.ADDON,
+            WSEvent.APP,
             {
                 ATTR_SLUG: self.slug,
                 ATTR_STATE: new_state,
@@ -293,7 +293,7 @@ class App(AppModel):
             self.has_deprecated_machine and not self.has_supported_machine
         ):
             self.sys_resolution.create_issue(
-                IssueType.DEPRECATED_ARCH_ADDON,
+                IssueType.DEPRECATED_ARCH_APP,
                 ContextType.ADDON,
                 reference=self.slug,
                 suggestions=[SuggestionType.EXECUTE_REMOVE],
@@ -1057,7 +1057,11 @@ class App(AppModel):
         store = self.app_store.clone()
 
         try:
-            await self.instance.update(store.version, store.image, arch=self.arch)
+            # Use the store's architecture list to pick the image architecture. The
+            # installed version may not support any of the system's architectures
+            # anymore (e.g. after 32-bit support was dropped), while the new version
+            # does — availability of the store version was validated by the caller.
+            await self.instance.update(store.version, store.image, arch=store.arch)
         except DockerBuildError as err:
             _LOGGER.error("Could not build image for app %s: %s", self.slug, err)
             raise AppBuildFailedUnknownError(app=self.slug) from err

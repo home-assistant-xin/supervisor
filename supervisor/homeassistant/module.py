@@ -167,16 +167,25 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         self._http_server_host = value
 
     @property
+    def api_authority(self) -> str:
+        """Return host with port for Home Assistant URLs.
+
+        The port is left out when it is the default one for the scheme, so
+        URLs stay in the form users see them in.
+        """
+        if self.api_port == (443 if self.api_ssl else 80):
+            return str(self.ip_address)
+        return f"{self.ip_address}:{self.api_port}"
+
+    @property
     def api_url(self) -> str:
         """Return API url to Home Assistant."""
-        return (
-            f"{'https' if self.api_ssl else 'http'}://{self.ip_address}:{self.api_port}"
-        )
+        return f"{'https' if self.api_ssl else 'http'}://{self.api_authority}"
 
     @property
     def ws_url(self) -> str:
         """Return API url to Home Assistant."""
-        return f"{'wss' if self.api_ssl else 'ws'}://{self.ip_address}:{self.api_port}/api/websocket"
+        return f"{'wss' if self.api_ssl else 'ws'}://{self.api_authority}/api/websocket"
 
     @property
     def watchdog(self) -> bool:
@@ -218,6 +227,17 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
     def override_image(self, value: bool) -> None:
         """Enable/disable image override."""
         self._data[ATTR_OVERRIDE_IMAGE] = value
+
+    @property
+    def install_image(self) -> str | None:
+        """Return image to pull when installing or updating Home Assistant Core.
+
+        Uses the user-overridden image if set, otherwise the image from the
+        update information.
+        """
+        if self.override_image:
+            return self.image
+        return self.sys_updater.image_homeassistant
 
     @property
     def version(self) -> AwesomeVersion | None:

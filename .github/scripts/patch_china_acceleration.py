@@ -12,8 +12,8 @@ original sed approach:
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
+import sys
 
 
 def _replace_once(content: str, old: str, new: str, label: str) -> str:
@@ -29,6 +29,7 @@ def _replace_once(content: str, old: str, new: str, label: str) -> str:
 
 
 def patch_interface(filepath: Path) -> None:
+    """Patch docker/interface.py for China acceleration."""
     content = filepath.read_text(encoding="utf-8")
 
     content = _replace_once(
@@ -141,6 +142,7 @@ def patch_interface(filepath: Path) -> None:
 
 
 def patch_os_manager(filepath: Path) -> None:
+    """Patch os/manager.py for China acceleration."""
     content = filepath.read_text(encoding="utf-8")
 
     content = _replace_once(
@@ -163,6 +165,7 @@ def patch_os_manager(filepath: Path) -> None:
 
 
 def patch_const(filepath: Path) -> None:
+    """Patch supervisor/const.py for China acceleration."""
     content = filepath.read_text(encoding="utf-8")
 
     content = _replace_once(
@@ -189,6 +192,7 @@ def patch_const(filepath: Path) -> None:
 
 
 def patch_store_const(filepath: Path) -> None:
+    """Patch supervisor/store/const.py for China acceleration."""
     content = filepath.read_text(encoding="utf-8")
 
     content = _replace_once(
@@ -215,6 +219,7 @@ def patch_store_const(filepath: Path) -> None:
 
 
 def patch_pyproject(filepath: Path) -> None:
+    """Patch pyproject.toml for China acceleration."""
     content = filepath.read_text(encoding="utf-8")
 
     old = "https://github.com/home-assistant/"
@@ -230,6 +235,7 @@ def patch_pyproject(filepath: Path) -> None:
 
 
 def patch_dockerfile(filepath: Path) -> None:
+    """Patch Dockerfile for China acceleration."""
     content = filepath.read_text(encoding="utf-8")
 
     content = _replace_once(
@@ -246,6 +252,7 @@ def patch_dockerfile(filepath: Path) -> None:
 
 
 def main() -> None:
+    """Apply all China acceleration patches to supervisor source."""
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
     patch_const(root / "supervisor" / "const.py")
     patch_store_const(root / "supervisor" / "store" / "const.py")

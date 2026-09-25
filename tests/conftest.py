@@ -230,11 +230,28 @@ async def docker() -> DockerAPI:
         docker_containers.get.return_value = docker_container = MagicMock(
             spec=DockerContainer, id=container_inspect["Id"]
         )
+        # container() is the sync, no-I/O counterpart to get(); alias it to
+        # the same mock so callers get consistent container state either way.
+        docker_containers.container.return_value = docker_container
         docker_containers.list.return_value = [docker_container]
         docker_containers.create.return_value = docker_container
         docker_container.show.return_value = container_inspect
         docker_container.wait.return_value = {"StatusCode": 0}
         docker_container.log = AsyncMock(return_value=[])
+        # Default stats response looks like Docker's stub for a stopped
+        # container (no online_cpus in cpu_stats), matching the default
+        # "stopped" state above. Tests for a running container should
+        # override this with a full stats payload.
+        docker_container.stats = AsyncMock(
+            return_value=[
+                {
+                    "id": container_inspect["Id"],
+                    "name": "mycontainer",
+                    "cpu_stats": {"cpu_usage": {"total_usage": 0}},
+                    "memory_stats": {},
+                }
+            ]
+        )
 
         docker_container.exec.return_value = docker_exec = MagicMock(spec=Exec)
         # start() with detach=False returns a Stream (not async)
@@ -593,7 +610,6 @@ async def tmp_supervisor_data(coresys: CoreSys, tmp_path: Path) -> Path:
     with patch.object(
         su_config.CoreConfig, "path_supervisor", new=PropertyMock(return_value=tmp_path)
     ):
-        coresys.config.path_emergency.mkdir()
         coresys.config.path_media.mkdir()
         coresys.config.path_mounts.mkdir()
         coresys.config.path_mounts_credentials.mkdir()
@@ -965,6 +981,10 @@ def create_mock_exec_stream(output: bytes = b"") -> AsyncMock:
 async def container(docker: DockerAPI) -> DockerContainer:
     """Mock attrs and status for container on attach."""
     container_mock = docker.containers.get.return_value
+    # container_stats() uses containers.container() (no I/O) instead of
+    # containers.get() for the windowed stats path, so alias it to the same
+    # mock to keep both entry points in sync for tests.
+    docker.containers.container.return_value = container_mock
 
     # Set up exec mock to return a mock stream
     # Note: This must be a regular function, not async, to match aiodocker's start() behavior

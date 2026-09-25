@@ -18,10 +18,17 @@ from supervisor.docker.interface import DockerInterface
 from supervisor.docker.manager import DockerAPI
 from supervisor.exceptions import (
     AudioUpdateError,
+    DockerAPIError,
+    DockerContainerNotFoundError,
+    DockerContainerNotRunningError,
     DockerError,
+    DockerStatsTimeoutError,
     HomeAssistantCrashError,
     HomeAssistantError,
     HomeAssistantJobError,
+    HomeAssistantNotRunningError,
+    HomeAssistantStatsTimeoutError,
+    HomeAssistantUnknownError,
     SupervisorUpdateError,
 )
 from supervisor.homeassistant.api import APIState
@@ -587,7 +594,7 @@ async def test_start(
     coresys.docker.images.inspect.return_value = {"Id": "123"}
     coresys.docker.images.inspect.side_effect = image_exc
     container.id = "123"
-    coresys.docker.containers.get.side_effect = container_exc
+    container.stop.side_effect = container_exc
 
     with (
         patch.object(
@@ -609,7 +616,7 @@ async def test_start(
         assert run.call_args.kwargs["name"] == "homeassistant"
         assert run.call_args.kwargs["hostname"] == "homeassistant"
 
-    container.stop.assert_not_called()
+    container.stop.assert_called_once_with(t=260)
     assert container.delete.call_args_list == delete_calls
 
 
@@ -641,21 +648,13 @@ async def test_start_existing_container(coresys: CoreSys, container: DockerConta
 @pytest.mark.parametrize("exists", [True, False])
 async def test_stop(coresys: CoreSys, container: DockerContainer, exists: bool):
     """Test stopping Home Assistant."""
-    if exists:
-        container.show.return_value["State"]["Status"] = "running"
-        container.show.return_value["State"]["Running"] = True
-    else:
-        coresys.docker.containers.get.side_effect = aiodocker.DockerError(
-            404, {"message": "missing"}
-        )
+    if not exists:
+        container.stop.side_effect = aiodocker.DockerError(404, {"message": "missing"})
 
     await coresys.homeassistant.core.stop()
 
+    container.stop.assert_called_once_with(t=260)
     container.delete.assert_not_called()
-    if exists:
-        container.stop.assert_called_once_with(t=260)
-    else:
-        container.stop.assert_not_called()
 
 
 async def test_restart(coresys: CoreSys, container: DockerContainer):
@@ -691,28 +690,33 @@ async def test_restart_failures(
 
 
 @pytest.mark.parametrize(
-    ("get_error", "running"),
+    ("docker_error", "expected_error"),
     [
-        (aiodocker.DockerError(404, {"message": "missing"}), False),
-        (aiodocker.DockerError(500, {"message": "fail"}), False),
-        (None, False),
-        (None, True),
+        (
+            DockerContainerNotFoundError(name="homeassistant"),
+            HomeAssistantNotRunningError,
+        ),
+        (
+            DockerContainerNotRunningError(name="homeassistant"),
+            HomeAssistantNotRunningError,
+        ),
+        (
+            DockerStatsTimeoutError(name="homeassistant"),
+            HomeAssistantStatsTimeoutError,
+        ),
+        (DockerAPIError(), HomeAssistantUnknownError),
     ],
 )
 async def test_stats_failures(
     coresys: CoreSys,
-    container: DockerContainer,
-    get_error: aiodocker.DockerError | None,
-    running: bool,
+    docker_error: DockerError,
+    expected_error: type[HomeAssistantError],
 ):
-    """Test errors when getting stats."""
-    container.show.return_value["State"]["Status"] = "running" if running else "stopped"
-    container.show.return_value["State"]["Running"] = running
-    container.stats.side_effect = aiodocker.DockerError(500, {"message": "fail"})
-    if get_error:
-        coresys.docker.containers.get.side_effect = get_error
-
-    with pytest.raises(HomeAssistantError):
+    """Test container stats errors are translated to Home Assistant-flavored errors."""
+    with (
+        patch.object(DockerAPI, "container_stats", AsyncMock(side_effect=docker_error)),
+        pytest.raises(expected_error),
+    ):
         await coresys.homeassistant.core.stats()
 
 

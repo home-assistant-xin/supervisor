@@ -34,12 +34,20 @@ from supervisor.docker.manager import CommandReturn, DockerAPI
 from supervisor.docker.monitor import DockerContainerStateEvent
 from supervisor.exceptions import (
     AppFileReadError,
+    AppNotRunningError,
     AppPortConflict,
     AppPrePostBackupCommandReturnedError,
+    AppsError,
     AppsJobError,
+    AppStatsTimeoutError,
     AppUnknownError,
     AudioUpdateError,
+    DockerAPIError,
+    DockerContainerNotFoundError,
+    DockerContainerNotRunningError,
+    DockerError,
     DockerRegistryAuthError,
+    DockerStatsTimeoutError,
     HassioError,
 )
 from supervisor.hardware.helper import HwHelper
@@ -606,6 +614,29 @@ async def test_restart(coresys: CoreSys, install_app_ssh: App) -> None:
     assert install_app_ssh.state == AppState.STARTED
 
 
+@pytest.mark.parametrize(
+    ("docker_error", "expected_error"),
+    [
+        (DockerContainerNotFoundError(name="app_local_ssh"), AppNotRunningError),
+        (DockerContainerNotRunningError(name="app_local_ssh"), AppNotRunningError),
+        (DockerStatsTimeoutError(name="app_local_ssh"), AppStatsTimeoutError),
+        (DockerAPIError(), AppUnknownError),
+    ],
+)
+async def test_stats_failures(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    docker_error: DockerError,
+    expected_error: type[AppsError],
+) -> None:
+    """Test container stats errors are translated to app-flavored errors."""
+    with (
+        patch.object(DockerAPI, "container_stats", AsyncMock(side_effect=docker_error)),
+        pytest.raises(expected_error),
+    ):
+        await install_app_ssh.stats()
+
+
 @pytest.mark.parametrize("status", ["running", "stopped"])
 @pytest.mark.usefixtures("tmp_supervisor_data", "path_extern")
 async def test_backup(
@@ -680,7 +711,7 @@ async def test_backup_with_pre_post_command(
 
 @pytest.mark.parametrize(
     (
-        "container_get_side_effect",
+        "exec_side_effect",
         "exec_start_side_effect",
         "exec_inspect_side_effect",
         "exc_type_raised",
@@ -717,13 +748,13 @@ async def test_backup_with_pre_post_command(
 async def test_backup_with_pre_command_error(
     coresys: CoreSys,
     install_app_ssh: App,
-    container_get_side_effect: aiodocker.DockerError | None,
+    exec_side_effect: aiodocker.DockerError | None,
     exec_start_side_effect: aiodocker.DockerError | None,
     exec_inspect_side_effect: aiodocker.DockerError | list[dict[str, Any]] | None,
     exc_type_raised: type[HassioError],
 ) -> None:
     """Test backing up an app with error running pre command."""
-    coresys.docker.containers.get.side_effect = container_get_side_effect
+    coresys.docker.containers.get.return_value.exec.side_effect = exec_side_effect
     coresys.docker.containers.get.return_value.exec.return_value.start.side_effect = (
         exec_start_side_effect
     )

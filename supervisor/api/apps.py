@@ -23,12 +23,9 @@ from ..const import (
     ATTR_AUTH_API,
     ATTR_AUTO_UPDATE,
     ATTR_AVAILABLE,
-    ATTR_BLK_READ,
-    ATTR_BLK_WRITE,
     ATTR_BOOT,
     ATTR_BUILD,
     ATTR_CHANGELOG,
-    ATTR_CPU_PERCENT,
     ATTR_DESCRIPTON,
     ATTR_DETACHED,
     ATTR_DEVICES,
@@ -61,14 +58,10 @@ from ..const import (
     ATTR_LOGO,
     ATTR_LONG_DESCRIPTION,
     ATTR_MACHINE,
-    ATTR_MEMORY_LIMIT,
-    ATTR_MEMORY_PERCENT,
-    ATTR_MEMORY_USAGE,
     ATTR_NAME,
     ATTR_NETWORK,
     ATTR_NETWORK_DESCRIPTION,
-    ATTR_NETWORK_RX,
-    ATTR_NETWORK_TX,
+    ATTR_ONE_SHOT,
     ATTR_OPTIONS,
     ATTR_PRIVILEGED,
     ATTR_PROTECTED,
@@ -115,7 +108,7 @@ from ..exceptions import (
 )
 from ..validate import docker_ports
 from .const import ATTR_BOOT_CONFIG, ATTR_REMOVE_CONFIG, ATTR_SIGNED
-from .utils import api_process, api_validate, json_loads
+from .utils import api_process, api_return_stats, api_validate, json_loads
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -189,7 +182,6 @@ class APIApps(CoreSysAttributes):
                 ATTR_NAME: app.name,
                 ATTR_SLUG: app.slug,
                 ATTR_DESCRIPTON: app.description,
-                ATTR_ADVANCED: app.advanced,  # Deprecated 2026.03
                 ATTR_STAGE: app.stage,
                 ATTR_VERSION: app.version,
                 ATTR_VERSION_LATEST: app.latest_version,
@@ -216,7 +208,10 @@ class APIApps(CoreSysAttributes):
     @api_process
     async def list_apps_v1(self, request: web.Request) -> dict[str, Any]:
         """Return all installed apps (v1: uses "addons" key)."""
-        return {ATTR_ADDONS: self._list_apps_data()}
+        data = self._list_apps_data()
+        for idx, app in enumerate(self.sys_apps.installed):
+            data[idx][ATTR_ADVANCED] = app.advanced  # Deprecated 2026.03
+        return {ATTR_ADDONS: data}
 
     @api_process
     async def reload(self, request: web.Request) -> None:
@@ -243,7 +238,6 @@ class APIApps(CoreSysAttributes):
             ATTR_DNS: app.dns,
             ATTR_DESCRIPTON: app.description,
             ATTR_LONG_DESCRIPTION: await app.long_description(),
-            ATTR_ADVANCED: app.advanced,  # Deprecated 2026.03
             ATTR_STAGE: app.stage,
             ATTR_REPOSITORY: app.repository,
             ATTR_VERSION_LATEST: app.latest_version,
@@ -311,6 +305,12 @@ class APIApps(CoreSysAttributes):
             ATTR_SYSTEM_MANAGED: app.system_managed,
             ATTR_SYSTEM_MANAGED_CONFIG_ENTRY: app.system_managed_config_entry,
         }
+
+    async def info_data_v1(self, app: App, request: web.Request) -> dict[str, Any]:
+        """Build and return v1 app information dict."""
+        data = await self.info_data(app, request)
+        data[ATTR_ADVANCED] = app.advanced  # Deprecated 2026.03
+        return data
 
     @api_process
     async def info(self, request: web.Request) -> dict[str, Any]:
@@ -446,21 +446,21 @@ class APIApps(CoreSysAttributes):
 
     @api_process
     async def stats(self, request: web.Request) -> dict[str, Any]:
+        """Return resource information for v2 contract (always one-shot)."""
+        app = self.get_app_for_request(request)
+
+        stats: DockerStats = await app.stats(one_shot=True)
+        return api_return_stats(stats, legacy=False)
+
+    @api_process
+    async def stats_v1(self, request: web.Request) -> dict[str, Any]:
         """Return resource information."""
         app = self.get_app_for_request(request)
 
-        stats: DockerStats = await app.stats()
+        one_shot = ATTR_ONE_SHOT in request.query
+        stats: DockerStats = await app.stats(one_shot=one_shot)
 
-        return {
-            ATTR_CPU_PERCENT: stats.cpu_percent,
-            ATTR_MEMORY_USAGE: stats.memory_usage,
-            ATTR_MEMORY_LIMIT: stats.memory_limit,
-            ATTR_MEMORY_PERCENT: stats.memory_percent,
-            ATTR_NETWORK_RX: stats.network_rx,
-            ATTR_NETWORK_TX: stats.network_tx,
-            ATTR_BLK_READ: stats.blk_read,
-            ATTR_BLK_WRITE: stats.blk_write,
-        }
+        return api_return_stats(stats, legacy=True)
 
     @api_process
     async def uninstall(self, request: web.Request) -> None:

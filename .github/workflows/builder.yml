@@ -117,11 +117,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Chinese source replacements
-      - name: Set source
-        run: |
-          python3 .github/scripts/patch_china_acceleration.py
-
       - name: Write env-file for wheels build
         if: needs.init.outputs.build_wheels == 'true'
         run: |
@@ -263,11 +258,6 @@ jobs:
           name: wheels-amd64
           path: wheels
 
-      # Chinese source replacements
-      - name: Set source
-        run: |
-          python3 .github/scripts/patch_china_acceleration.py
-
       # Build the Supervisor for non-publish runs (e.g. PRs)
       - name: Build the Supervisor
         if: needs.init.outputs.publish != 'true'
@@ -285,7 +275,7 @@ jobs:
         if: needs.init.outputs.publish == 'true'
         run: |
           docker pull ghcr.io/home-assistant-xin/amd64-hassio-supervisor:${{ needs.init.outputs.version }}
-          docker tag ghcr.io/home-assistant-xin/amd64-hassio-supervisor:${{ needs.init.outputs.version }} ghcr.io/home-assistant-xin/amd64-hassio-supervisor:runner
+          docker tag ghcr.io/home-assistant-xin/amd64-hassio-supervisor:${{ needs.init.outputs.version }} ghcr.io/home-assistant-xin/istant/amd64-hassio-supervisor:runner
 
       - name: Create the Supervisor
         run: |

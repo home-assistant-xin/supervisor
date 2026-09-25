@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: T201
 """Patch supervisor source for China acceleration at build time.
 
 Replaces all sed-based GitHub Variables (VERSION_SOURCE, ADDONS_SOURCE,

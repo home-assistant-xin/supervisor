@@ -19,6 +19,7 @@ import voluptuous as vol
 from voluptuous.error import CoerceInvalid
 
 from ..const import (
+    ATTR_ALL_FEATURES,
     ATTR_CHASSIS,
     ATTR_CPE,
     ATTR_DEPLOYMENT,
@@ -37,14 +38,12 @@ from ..const import (
     ATTR_TIMEZONE,
 )
 from ..coresys import CoreSysAttributes
-from ..dbus.const import UnitActiveState
 from ..exceptions import (
     APIDBMigrationInProgress,
     APIError,
     HostContainerLogEpochError,
     HostLogError,
     MountNotFound,
-    MountUsageNotActiveError,
     MountUsageNotMountedError,
     MountUsageReadError,
     MountUsageTimeoutError,
@@ -53,6 +52,7 @@ from ..host.const import (
     PARAM_BOOT_ID,
     PARAM_FOLLOW,
     PARAM_SYSLOG_IDENTIFIER,
+    HostFeature,
     LogFormat,
     LogFormatter,
 )
@@ -158,9 +158,8 @@ class APIHost(CoreSysAttributes):
                 "Home Assistant offline database migration in progress, please wait until complete before shutting down host"
             )
 
-    @api_process
-    async def info(self, request: web.Request) -> dict[str, Any]:
-        """Return host information."""
+    async def _info_data(self) -> dict[str, Any]:
+        """Return host information data."""
         return {
             ATTR_AGENT_VERSION: self.sys_dbus.agent.version,
             ATTR_APPARMOR_VERSION: self.sys_host.apparmor.version,
@@ -186,6 +185,28 @@ class APIHost(CoreSysAttributes):
             ATTR_BROADCAST_LLMNR: self.sys_host.info.broadcast_llmnr,
             ATTR_BROADCAST_MDNS: self.sys_host.info.broadcast_mdns,
         }
+
+    @api_process
+    async def info(self, request: web.Request) -> dict[str, Any]:
+        """Return host information."""
+        return await self._info_data()
+
+    @api_process
+    async def info_v1(self, request: web.Request) -> dict[str, Any]:
+        """Return host information with a v1-compatible features list.
+
+        The python-supervisor-client library's ``HostFeature`` model is a
+        strict enum rather than ``HostFeature | str``, so new feature values
+        (such as ``ntp``, added for NTP support) break older clients that
+        parse the ``features`` field. Hide ``ntp`` from that field for v1 and
+        expose the full, unfiltered list under ``all_features`` instead.
+        """
+        data = await self._info_data()
+        data[ATTR_ALL_FEATURES] = data[ATTR_FEATURES]
+        data[ATTR_FEATURES] = [
+            feature for feature in data[ATTR_FEATURES] if feature != HostFeature.NTP
+        ]
+        return data
 
     @api_process
     async def options(self, request: web.Request) -> None:
@@ -471,8 +492,8 @@ class APIHost(CoreSysAttributes):
             raise MountNotFound(name=name)
 
         mount = self.sys_mounts.get(name)
-        if mount.state != UnitActiveState.ACTIVE:
-            raise MountUsageNotActiveError(name=name)
+        # Don't use cached mount state — it can be 15 minutes stale.
+        # The probe below activates a dormant automount if needed.
 
         max_depth = self._requested_max_depth(request, DISK_USAGE_MAX_DEPTH_MOUNT)
         # All depths below 2 give totals only; normalize so concurrent callers
@@ -568,10 +589,9 @@ class APIHost(CoreSysAttributes):
             raise MountUsageReadError(name=mount.name, reason=str(err)) from err
 
         if usage is None:
-            # Ghost mount: systemd still reports the unit active, but the path
-            # no longer crosses a filesystem boundary, so statvfs was reading
-            # the host's data disk and would report its numbers under the
-            # mount's name.
+            # Not a mount point. The probe would already have activated a
+            # dormant automount, so this is a plain directory — don't report
+            # the host data disk's numbers as this mount.
             raise MountUsageNotMountedError(name=mount.name)
 
         total, _, free = usage

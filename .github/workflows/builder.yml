@@ -130,21 +130,8 @@ jobs:
             echo "CARGO_NET_GIT_FETCH_WITH_CLI=true"
           ) > .env_file
 
-      - name: Build and publish wheels
-        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'true'
-        uses: home-assistant/wheels@9e17ab1ed5c4c79d8b61e29fa63de25ca2710716 # 2026.07.0
-        with:
-          wheels-key: ${{ secrets.WHEELS_KEY }}
-          abi: ${{ env.WHEELS_ABI }}
-          tag: ${{ env.WHEELS_TAG }}
-          arch: ${{ matrix.arch }}
-          apk: ${{ env.WHEELS_APK_DEPS }}
-          skip-binary: ${{ env.WHEELS_SKIP_BINARY }}
-          env-file: true
-          requirements: "requirements.txt"
-
       - name: Build local wheels
-        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'false'
+        if: needs.init.outputs.build_wheels == 'true'
         uses: home-assistant/wheels@9e17ab1ed5c4c79d8b61e29fa63de25ca2710716 # 2026.07.0
         with:
           wheels-host: ""
@@ -160,7 +147,7 @@ jobs:
           requirements: "requirements.txt"
 
       - name: Upload local wheels artifact
-        if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'false'
+        if: needs.init.outputs.build_wheels == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wheels-${{ matrix.arch }}
@@ -256,17 +243,17 @@ jobs:
       - name: Checkout the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Chinese source replacements
+      - name: Set source
+        run: |
+          python3 .github/scripts/patch_china_acceleration.py
+
       - name: Download local wheels artifact
         if: needs.init.outputs.build_wheels == 'true' && needs.init.outputs.publish == 'false'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: wheels-amd64
           path: wheels
-
-      # Chinese source replacements
-      - name: Set source
-        run: |
-          python3 .github/scripts/patch_china_acceleration.py
 
       # Build the Supervisor for non-publish runs (e.g. PRs)
       - name: Build the Supervisor
@@ -285,7 +272,7 @@ jobs:
         if: needs.init.outputs.publish == 'true'
         run: |
           docker pull ghcr.io/home-assistant-xin/amd64-hassio-supervisor:${{ needs.init.outputs.version }}
-          docker tag ghcr.io/home-assistant-xin/amd64-hassio-supervisor:${{ needs.init.outputs.version }} ghcr.io/home-assistant-xin/istant/amd64-hassio-supervisor:runner
+          docker tag ghcr.io/home-assistant-xin/amd64-hassio-supervisor:${{ needs.init.outputs.version }} ghcr.io/home-assistant-xin/amd64-hassio-supervisor:runner
 
       - name: Create the Supervisor
         run: |

@@ -108,7 +108,13 @@ from ..exceptions import (
 )
 from ..validate import docker_ports
 from .const import ATTR_BOOT_CONFIG, ATTR_REMOVE_CONFIG, ATTR_SIGNED
-from .utils import api_process, api_return_stats, api_validate, json_loads
+from .utils import (
+    api_process,
+    api_return_stats,
+    api_validate,
+    json_loads,
+    require_running_system,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -329,9 +335,11 @@ class APIApps(CoreSysAttributes):
         # Validate/Process Body
         body = await api_validate(SCHEMA_OPTIONS, request)
         if body.get(ATTR_OPTIONS) is not None:
-            # Validate options
+            # Persist "!secret x" references, not the resolved secrets
             try:
-                body[ATTR_OPTIONS] = app.schema(body[ATTR_OPTIONS])
+                body[ATTR_OPTIONS] = app.options_schema(resolve_secrets=False)(
+                    body[ATTR_OPTIONS]
+                )
             except vol.Invalid as ex:
                 raise AppConfigurationInvalidError(
                     app=app.slug,
@@ -472,6 +480,7 @@ class APIApps(CoreSysAttributes):
         )
 
     @api_process
+    @require_running_system
     async def start(self, request: web.Request) -> None:
         """Start app."""
         app = self.get_app_for_request(request)
@@ -485,6 +494,7 @@ class APIApps(CoreSysAttributes):
         return asyncio.shield(app.stop())
 
     @api_process
+    @require_running_system
     async def restart(self, request: web.Request) -> None:
         """Restart app."""
         app: App = self.get_app_for_request(request)
@@ -492,6 +502,7 @@ class APIApps(CoreSysAttributes):
             await start_task
 
     @api_process
+    @require_running_system
     async def rebuild(self, request: web.Request) -> None:
         """Rebuild local build app."""
         app = self.get_app_for_request(request)

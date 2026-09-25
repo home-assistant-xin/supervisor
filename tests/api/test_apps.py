@@ -14,7 +14,7 @@ import pytest
 from supervisor.apps.app import App
 from supervisor.apps.build import AppBuild
 from supervisor.arch import CpuArchManager
-from supervisor.const import AppState, CpuArch
+from supervisor.const import AppState, CoreState, CpuArch
 from supervisor.coresys import CoreSys
 from supervisor.docker.app import DockerApp
 from supervisor.docker.const import ContainerState
@@ -25,6 +25,17 @@ from supervisor.store.repository import Repository
 
 from ..common import force_app_state, load_json_fixture
 from ..const import TEST_ADDON_SLUG
+
+
+@pytest.fixture(autouse=True)
+async def running_state(coresys: CoreSys) -> None:
+    """Set the default state to a fully started system.
+
+    Starting/restarting/rebuilding an app via the API is only allowed once
+    Supervisor has fully started (see require_running_system). Tests
+    exercising other states set them explicitly.
+    """
+    await coresys.core.set_state(CoreState.RUNNING)
 
 
 def _create_test_event(name: str, state: ContainerState) -> DockerContainerStateEvent:
@@ -633,6 +644,33 @@ async def test_app_set_options(
     )
     assert resp.status == 200
     assert install_app_example.options == {"message": "test"}
+
+
+async def test_app_set_options_keeps_secret_refs(
+    app_api_client_with_root: tuple[TestClient, str],
+    install_app_example: App,
+    coresys: CoreSys,
+):
+    """Test !secret references persist as references, not resolved values."""
+    client, root = app_api_client_with_root
+    coresys.homeassistant.secrets.secrets = {"example_secret": "hunter2"}
+    install_app_example.data["schema"] = {
+        "message": "str?",
+        "credentials": {"username": "str", "password": "str"},
+        "servers": [{"host": "str", "token": "str"}],
+    }
+
+    options = {
+        "message": "!secret example_secret",
+        "credentials": {"username": "alice", "password": "!secret example_secret"},
+        "servers": [
+            {"host": "server1", "token": "!secret example_secret"},
+            {"host": "server2", "token": "plain-token"},
+        ],
+    }
+    resp = await client.post(f"{root}/local_example/options", json={"options": options})
+    assert resp.status == 200
+    assert install_app_example.options == options
 
 
 async def test_app_reset_options(

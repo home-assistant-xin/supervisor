@@ -15,11 +15,12 @@ from supervisor.apps import validate as vd
 from supervisor.apps.app import App
 from supervisor.apps.model import Data
 from supervisor.apps.options import AppOptions
-from supervisor.const import BusEvent
+from supervisor.const import BusEvent, FeatureFlag
 from supervisor.coresys import CoreSys
 from supervisor.dbus.agent.cgroup import CGroup
 from supervisor.docker.app import DockerApp
 from supervisor.docker.const import (
+    Capabilities,
     DockerMount,
     MountBindOptions,
     MountType,
@@ -1009,3 +1010,97 @@ async def test_app_hardware_events_get_timeout(
             DockerTimeoutError, match="Timeout processing Hardware Event"
         ):
             await fire_bus_event(coresys, BusEvent.HARDWARE_NEW_DEVICE, TEST_HW_DEVICE)
+
+
+@pytest.mark.parametrize(
+    ("flags", "privileged", "expected_drop"),
+    [
+        pytest.param([], [], None, id="no-flags"),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW], [], [Capabilities.NET_RAW], id="net-raw"
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW],
+            ["SYS_TIME"],
+            [Capabilities.NET_RAW],
+            id="net-raw-unrelated-privilege",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW], ["NET_RAW"], None, id="net-raw-requested"
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW],
+            ["NET_ADMIN"],
+            [Capabilities.NET_RAW],
+            id="net-raw-not-implied-by-net-admin",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_REDUCED_CAPABILITIES],
+            [],
+            [Capabilities.AUDIT_WRITE, Capabilities.MKNOD, Capabilities.SETFCAP],
+            id="reduced",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_REDUCED_CAPABILITIES],
+            ["MKNOD"],
+            [Capabilities.AUDIT_WRITE, Capabilities.SETFCAP],
+            id="reduced-mknod-requested",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_REDUCED_CAPABILITIES],
+            ["NET_RAW"],
+            [Capabilities.AUDIT_WRITE, Capabilities.MKNOD, Capabilities.SETFCAP],
+            id="reduced-keeps-net-raw",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW, FeatureFlag.APP_REDUCED_CAPABILITIES],
+            [],
+            [
+                Capabilities.NET_RAW,
+                Capabilities.AUDIT_WRITE,
+                Capabilities.MKNOD,
+                Capabilities.SETFCAP,
+            ],
+            id="both-flags",
+        ),
+        pytest.param(
+            [FeatureFlag.APP_DROP_NET_RAW, FeatureFlag.APP_REDUCED_CAPABILITIES],
+            ["NET_RAW", "AUDIT_WRITE", "MKNOD", "SETFCAP"],
+            None,
+            id="both-flags-all-requested",
+        ),
+    ],
+)
+async def test_dropped_capabilities_feature_flags(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    flags: list[FeatureFlag],
+    privileged: list[str],
+    expected_drop: list[Capabilities] | None,
+):
+    """Test capabilities are dropped per feature flag unless the app requests them."""
+    docker_app = DockerApp(coresys, install_app_ssh)
+    install_app_ssh.data["privileged"] = privileged
+    for flag in flags:
+        coresys.config.set_feature_flag(flag, True)
+
+    assert docker_app.dropped_capabilities == expected_drop
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_run_drops_net_raw_with_feature_flag(
+    coresys: CoreSys, install_app_ssh: App
+):
+    """Test the container is created with NET_RAW dropped when the flag is set."""
+    coresys.config.set_feature_flag(FeatureFlag.APP_DROP_NET_RAW, True)
+    docker_app = DockerApp(coresys, install_app_ssh)
+
+    with (
+        patch.object(DockerAPI, "run", return_value=MagicMock()) as run,
+        patch.object(DockerApp, "is_running", return_value=False),
+        patch.object(DockerApp, "stop"),
+    ):
+        await docker_app.run()
+
+    assert run.call_args.kwargs["cap_add"] is None
+    assert run.call_args.kwargs["cap_drop"] == [Capabilities.NET_RAW]

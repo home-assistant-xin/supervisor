@@ -117,6 +117,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Chinese source replacements
+      - name: Set source
+        run: |
+          python3 .github/scripts/patch_china_acceleration.py
+
       - name: Write env-file for wheels build
         if: needs.init.outputs.build_wheels == 'true'
         run: |
@@ -257,6 +262,11 @@ jobs:
         with:
           name: wheels-amd64
           path: wheels
+
+      # Chinese source replacements
+      - name: Set source
+        run: |
+          python3 .github/scripts/patch_china_acceleration.py
 
       # Build the Supervisor for non-publish runs (e.g. PRs)
       - name: Build the Supervisor
